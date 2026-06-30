@@ -369,14 +369,20 @@ Then continue from [Step 5 — Approve InstallPlans](#step-5--approve-installpla
 Deletes Argo CD Applications and all operator resources, then redeploys from git.
 Use when Argo CD itself is stuck or Level 1 did not clear the failure.
 
-```sh
-# 1. Delete Argo CD Applications (child apps first)
-oc delete application openshift-workload-operators-config -n openshift-gitops --ignore-not-found
-oc delete application openshift-workload-operators-install -n openshift-gitops --ignore-not-found
-oc delete application operator-config-files-root -n openshift-gitops --ignore-not-found
-oc delete application openshift-workload-operators -n openshift-gitops --ignore-not-found
+**Why simple `oc delete application` often fails:**
 
-# 2. Delete all operator and config resources
+1. **App-of-apps recreates child apps** — `operator-config-files-root` has
+   `automated: selfHeal: true`. Delete a child app and the root app immediately
+   recreates it from git.
+2. **Finalizers block deletion** — all apps use
+   `resources-finalizer.argocd.argoproj.io`. Argo CD will not remove an
+   Application until its managed resources are gone (or finalizers are cleared).
+3. **Apps stuck in Terminating** — remove finalizers manually (step 4 below).
+
+Follow these steps **in order**:
+
+```sh
+# --- Step A: Delete managed resources FIRST (releases app finalizers) ---
 oc delete nodehealthcheck --all -n openshift-workload-availability --ignore-not-found
 oc delete selfnoderemediationtemplate --all -n openshift-workload-availability --ignore-not-found
 oc delete kubedescheduler cluster --ignore-not-found
@@ -391,12 +397,34 @@ oc delete csv --all -n openshift-kube-descheduler-operator --ignore-not-found
 oc delete installplan --all -n openshift-kube-descheduler-operator --ignore-not-found
 oc delete operatorgroup --all -n openshift-kube-descheduler-operator --ignore-not-found
 
-# 3. Verify clean
-oc get subscription,csv,installplan,operatorgroup \
-  -n openshift-workload-availability
-oc get subscription,csv,installplan,operatorgroup \
-  -n openshift-kube-descheduler-operator
-oc get applications -n openshift-gitops | rg workload || true
+# --- Step B: Stop root app from recreating child apps ---
+oc patch application operator-config-files-root -n openshift-gitops --type=json \
+  -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]' 2>/dev/null || true
+
+# --- Step C: Delete child apps, then root app ---
+oc delete application openshift-workload-operators-config -n openshift-gitops --ignore-not-found --wait=false
+oc delete application openshift-workload-operators-install -n openshift-gitops --ignore-not-found --wait=false
+oc delete application openshift-workload-operators -n openshift-gitops --ignore-not-found --wait=false
+oc delete application operator-config-files-root -n openshift-gitops --ignore-not-found --wait=false
+
+# --- Step D: Force-remove finalizers if any app is stuck Terminating ---
+for app in openshift-workload-operators-config \
+           openshift-workload-operators-install \
+           openshift-workload-operators \
+           operator-config-files-root; do
+  oc patch application "${app}" -n openshift-gitops --type=merge \
+    -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+done
+
+# --- Step E: Verify all apps are gone ---
+oc get application -n openshift-gitops | rg -e 'workload|operator-config' || echo "All apps deleted"
+```
+
+If step D still leaves apps behind, check what is blocking:
+
+```sh
+oc get application -n openshift-gitops
+oc get application operator-config-files-root -n openshift-gitops -o yaml | tail -30
 ```
 
 Then continue from [Fresh deploy checklist](#fresh-deploy-checklist).
@@ -624,6 +652,51 @@ Use the force sync commands from [OpenShift GitOps helpers](#openshift-gitops-he
 ```sh
 oc get route openshift-gitops-server -n openshift-gitops \
   -o jsonpath='https://{.spec.host}{"\n"}'
+```
+
+### Argo CD Application will not delete
+
+**Symptom:** `oc delete application` hangs, app shows **Terminating**, or the
+app reappears immediately after deletion.
+
+**Cause 1 — Root app recreates it:** disable automation on the root app first:
+
+```sh
+oc patch application operator-config-files-root -n openshift-gitops --type=json \
+  -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]'
+```
+
+**Cause 2 — Finalizer waiting on managed resources:** delete OLM resources first
+(see [Level 2 Step A](#level-2-full-reset-including-argocd-apps)), then delete
+the Application.
+
+**Cause 3 — Stuck finalizer:** force clear and verify:
+
+```sh
+APP=openshift-workload-operators-install   # repeat for each stuck app
+
+oc delete application "${APP}" -n openshift-gitops --wait=false
+oc patch application "${APP}" -n openshift-gitops --type=merge \
+  -p '{"metadata":{"finalizers":null}}'
+oc get application "${APP}" -n openshift-gitops 2>&1 || echo "deleted"
+```
+
+Delete all operator-config-files apps:
+
+```sh
+oc patch application operator-config-files-root -n openshift-gitops --type=json \
+  -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]' 2>/dev/null || true
+
+for app in openshift-workload-operators-config \
+           openshift-workload-operators-install \
+           openshift-workload-operators \
+           operator-config-files-root; do
+  oc delete application "${app}" -n openshift-gitops --wait=false 2>/dev/null || true
+  oc patch application "${app}" -n openshift-gitops --type=merge \
+    -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+done
+
+oc get application -n openshift-gitops
 ```
 
 ### Argo CD cannot reach GitHub repo
