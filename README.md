@@ -83,10 +83,10 @@ git push origin main
 
 Argo CD Applications use SSH: `git@github.com:ravishar-rh/operator-config-files.git`
 
-Configure Argo CD with SSH access to GitHub before bootstrapping. Choose one
-method below.
+Configure Argo CD with GitHub access before bootstrapping. All steps below use
+`oc` only — no local `argocd` CLI required.
 
-#### Option A — `oc` secret (no argocd CLI login required)
+#### SSH (recommended)
 
 Add your SSH public key as a deploy key on GitHub first:
 https://github.com/ravishar-rh/operator-config-files/settings/keys → **Add deploy key**
@@ -112,35 +112,7 @@ Verify Argo CD picked up the repo (may take a few seconds):
 oc get secret -n openshift-gitops -l argocd.argoproj.io/secret-type=repository
 ```
 
-#### Option B — `argocd` CLI
-
-The CLI must be logged in before `argocd repo add` works. `Argo CD server
-address unspecified` means you skipped login.
-
-```sh
-# 1. Get the Argo CD route
-ARGOCD_SERVER=$(oc get route openshift-gitops-server -n openshift-gitops \
-  -o jsonpath='{.spec.host}')
-echo "Argo CD server: ${ARGOCD_SERVER}"
-
-# 2. Log in (pick one)
-
-# SSO (if configured on your cluster)
-argocd login "${ARGOCD_SERVER}" --sso --grpc-web
-
-# Or admin password
-argocd login "${ARGOCD_SERVER}" --username admin --password "$(
-  oc get secret openshift-gitops-cluster -n openshift-gitops \
-    -o jsonpath='{.data.admin\.password}' | base64 -d
-)" --grpc-web
-
-# 3. Add the repo
-argocd repo add git@github.com:ravishar-rh/operator-config-files.git \
-  --ssh-private-key-path "${HOME}/.ssh/id_ed25519" \
-  --grpc-web
-```
-
-#### Option C — HTTPS instead of SSH
+#### HTTPS instead of SSH
 
 Change `repoURL` in the Application CRs to HTTPS, or use a GitHub personal
 access token via an `oc` secret:
@@ -156,6 +128,64 @@ oc create secret generic repo-operator-config-files \
 oc label secret repo-operator-config-files \
   -n openshift-gitops \
   argocd.argoproj.io/secret-type=repository
+```
+
+## OpenShift GitOps helpers (`oc` only)
+
+Use these instead of the `argocd` CLI for common operations.
+
+### Check Application status
+
+```sh
+oc get applications -n openshift-gitops
+
+oc get application openshift-workload-operators-install -n openshift-gitops \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+
+oc get application openshift-workload-operators-config -n openshift-gitops \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+```
+
+### Refresh an Application (pull latest git commit)
+
+```sh
+APP=openshift-workload-operators-config
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+```
+
+### Sync an Application
+
+```sh
+APP=openshift-workload-operators-config
+
+# Trigger sync
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main"}}}'
+
+# Watch until sync completes
+watch oc get application "${APP}" -n openshift-gitops \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+```
+
+### Force sync (when resources are stuck OutOfSync)
+
+```sh
+APP=openshift-workload-operators-config
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main","syncStrategy":{"apply":{"force":true}},"prune":true}}}'
+```
+
+### Open Argo CD UI in browser (optional)
+
+```sh
+oc get route openshift-gitops-server -n openshift-gitops \
+  -o jsonpath='https://{.spec.host}{"\n"}'
 ```
 
 ### Step 2 — Remove old Application (if upgrading)
@@ -289,10 +319,16 @@ The config app depends on the install app and retries until CRDs exist.
 oc get application openshift-workload-operators-config -n openshift-gitops
 ```
 
-If still failing after all CSVs are Succeeded, force a sync:
+If still failing after all CSVs are Succeeded, refresh and sync the config app:
 
 ```sh
-argocd app sync openshift-workload-operators-config --force
+APP=openshift-workload-operators-config
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main","syncStrategy":{"apply":{"force":true}},"prune":true}}}'
 ```
 
 Verify config resources:
@@ -352,9 +388,14 @@ Fix:
 oc patch installplan <installplan-name> -n openshift-kube-descheduler-operator \
   --type merge -p '{"spec":{"approved":true}}'
 
-# Wait for CSV Succeeded, then re-sync config
+# Wait for CSV Succeeded, then refresh and sync config
 watch oc get csv -n openshift-kube-descheduler-operator
-argocd app sync openshift-workload-operators-config --force
+
+APP=openshift-workload-operators-config
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main","syncStrategy":{"apply":{"force":true}},"prune":true}}}'
 ```
 
 The config app retries automatically, but only succeeds once the descheduler
@@ -362,26 +403,24 @@ CSV completes and the CRD is **Established**.
 
 ### Config app stuck OutOfSync
 
-Hard refresh the config app in Argo CD UI, or:
+Use the force sync commands from [OpenShift GitOps helpers](#openshift-gitops-helpers-oc-only), or open the Argo CD UI:
 
 ```sh
-argocd app sync openshift-workload-operators-config --force
+oc get route openshift-gitops-server -n openshift-gitops \
+  -o jsonpath='https://{.spec.host}{"\n"}'
 ```
 
 ### Argo CD cannot reach GitHub repo
 
-`Argo CD server address unspecified` — run `argocd login` first (see Option B
-in Step 1), or use the `oc create secret` method (Option A) instead.
-
-Confirm the repo is registered:
+Confirm the repo secret exists and has the correct label:
 
 ```sh
 oc get secret -n openshift-gitops -l argocd.argoproj.io/secret-type=repository
-argocd repo list --grpc-web   # requires argocd login
+oc get secret repo-operator-config-files -n openshift-gitops -o yaml
 ```
 
 For SSH, ensure the matching public key is added to GitHub as a deploy key or
-account SSH key.
+account SSH key. Re-create the secret using the SSH steps in Step 1 if needed.
 
 ## Remediation backend
 
