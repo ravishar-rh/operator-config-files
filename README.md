@@ -83,13 +83,80 @@ git push origin main
 
 Argo CD Applications use SSH: `git@github.com:ravishar-rh/operator-config-files.git`
 
-Configure Argo CD with SSH access to GitHub before bootstrapping:
+Configure Argo CD with SSH access to GitHub before bootstrapping. Choose one
+method below.
 
-- **Argo CD UI** → Settings → Repositories → Connect repo (via SSH), or
-- **CLI**: `argocd repo add git@github.com:ravishar-rh/operator-config-files.git --ssh-private-key-path ~/.ssh/id_ed25519`
+#### Option A — `oc` secret (no argocd CLI login required)
 
-Alternatively, change `repoURL` in the Application CRs to HTTPS if SSH is not
-configured in Argo CD.
+Add your SSH public key as a deploy key on GitHub first:
+https://github.com/ravishar-rh/operator-config-files/settings/keys → **Add deploy key**
+(read-only is sufficient).
+
+Then register the repo in Argo CD:
+
+```sh
+oc create secret generic repo-operator-config-files \
+  -n openshift-gitops \
+  --from-literal=type=git \
+  --from-literal=url=git@github.com:ravishar-rh/operator-config-files.git \
+  --from-file=sshPrivateKey="${HOME}/.ssh/id_ed25519"
+
+oc label secret repo-operator-config-files \
+  -n openshift-gitops \
+  argocd.argoproj.io/secret-type=repository
+```
+
+Verify Argo CD picked up the repo (may take a few seconds):
+
+```sh
+oc get secret -n openshift-gitops -l argocd.argoproj.io/secret-type=repository
+```
+
+#### Option B — `argocd` CLI
+
+The CLI must be logged in before `argocd repo add` works. `Argo CD server
+address unspecified` means you skipped login.
+
+```sh
+# 1. Get the Argo CD route
+ARGOCD_SERVER=$(oc get route openshift-gitops-server -n openshift-gitops \
+  -o jsonpath='{.spec.host}')
+echo "Argo CD server: ${ARGOCD_SERVER}"
+
+# 2. Log in (pick one)
+
+# SSO (if configured on your cluster)
+argocd login "${ARGOCD_SERVER}" --sso --grpc-web
+
+# Or admin password
+argocd login "${ARGOCD_SERVER}" --username admin --password "$(
+  oc get secret openshift-gitops-cluster -n openshift-gitops \
+    -o jsonpath='{.data.admin\.password}' | base64 -d
+)" --grpc-web
+
+# 3. Add the repo
+argocd repo add git@github.com:ravishar-rh/operator-config-files.git \
+  --ssh-private-key-path "${HOME}/.ssh/id_ed25519" \
+  --grpc-web
+```
+
+#### Option C — HTTPS instead of SSH
+
+Change `repoURL` in the Application CRs to HTTPS, or use a GitHub personal
+access token via an `oc` secret:
+
+```sh
+oc create secret generic repo-operator-config-files \
+  -n openshift-gitops \
+  --from-literal=type=git \
+  --from-literal=url=https://github.com/ravishar-rh/operator-config-files.git \
+  --from-literal=username=git \
+  --from-literal=password=<github-pat>
+
+oc label secret repo-operator-config-files \
+  -n openshift-gitops \
+  argocd.argoproj.io/secret-type=repository
+```
 
 ### Step 2 — Remove old Application (if upgrading)
 
@@ -277,8 +344,18 @@ argocd app sync openshift-workload-operators-config --force
 
 ### Argo CD cannot reach GitHub repo
 
-Confirm the repo is registered in Argo CD with a valid SSH key or switch
-Application `repoURL` to HTTPS.
+`Argo CD server address unspecified` — run `argocd login` first (see Option B
+in Step 1), or use the `oc create secret` method (Option A) instead.
+
+Confirm the repo is registered:
+
+```sh
+oc get secret -n openshift-gitops -l argocd.argoproj.io/secret-type=repository
+argocd repo list --grpc-web   # requires argocd login
+```
+
+For SSH, ensure the matching public key is added to GitHub as a deploy key or
+account SSH key.
 
 ## Remediation backend
 
