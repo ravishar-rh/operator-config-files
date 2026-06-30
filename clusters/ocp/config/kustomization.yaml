@@ -3,4 +3,3 @@ kind: Kustomization
 resources:
   - ../../../self-node-remediation-operator/config
   - ../../../node-health-check-operator/config
-  - ../../../kube-descheduler-operator/config

@@ -11,6 +11,7 @@ BASE_DIR="${OUT_DIR}/base/${WORKLOAD_NAMESPACE}"
 CLUSTER_OVERLAY="${OUT_DIR}/clusters/ocp"
 CLUSTER_INSTALL="${CLUSTER_OVERLAY}/install"
 CLUSTER_CONFIG="${CLUSTER_OVERLAY}/config"
+CLUSTER_CONFIG_DESCHEDULER="${CLUSTER_OVERLAY}/config-descheduler"
 
 DEFAULT_OPERATORS=(
   node-maintenance-operator
@@ -230,14 +231,24 @@ write_cluster_overlays() {
 
   for operator in "${operators[@]}"; do
     install_resources+=("../../../${operator}/install")
-    if [[ -d "${OUT_DIR}/${operator}/config" ]]; then
-      config_resources+=("../../../${operator}/config")
-    fi
+    case "${operator}" in
+      kube-descheduler-operator)
+        # Cluster-scoped KubeDescheduler must not share an Argo CD app with
+        # namespaced CRs — Argo CD reports InvalidSpecError without namespace.
+        ;;
+      *)
+        if [[ -d "${OUT_DIR}/${operator}/config" ]]; then
+          config_resources+=("../../../${operator}/config")
+        fi
+        ;;
+    esac
   done
 
-  mkdir -p "${CLUSTER_INSTALL}" "${CLUSTER_CONFIG}"
+  mkdir -p "${CLUSTER_INSTALL}" "${CLUSTER_CONFIG}" "${CLUSTER_CONFIG_DESCHEDULER}"
   write_kustomization "${CLUSTER_INSTALL}" "${install_resources[@]}"
   write_kustomization "${CLUSTER_CONFIG}" "${config_resources[@]}"
+  write_kustomization "${CLUSTER_CONFIG_DESCHEDULER}" \
+    "../../../kube-descheduler-operator/config"
 
   cat > "${CLUSTER_OVERLAY}/kustomization.yaml" <<'EOF'
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -245,6 +256,7 @@ kind: Kustomization
 resources:
   - install
   - config
+  - config-descheduler
 EOF
 }
 
@@ -262,6 +274,29 @@ metadata:
   annotations:
     argocd.argoproj.io/sync-wave: "1"
 spec: {}
+EOF
+  fi
+}
+
+patch_descheduler_config() {
+  local kd="${OUT_DIR}/kube-descheduler-operator/config/kube-descheduler-cluster.yaml"
+  if [[ -f "${kd}" ]]; then
+    # devLowNodeUtilizationThresholds is a string enum (Low/Medium/High), not an
+    # object — the upstream helm values.yaml structure is invalid for OCP API.
+    cat > "${kd}" <<'EOF'
+apiVersion: operator.openshift.io/v1
+kind: KubeDescheduler
+metadata:
+  name: cluster
+  annotations:
+    argocd.argoproj.io/sync-wave: "8"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  managementState: Managed
+  profileCustomizations:
+    devLowNodeUtilizationThresholds: Medium
+  profiles:
+  - LifecycleAndUtilization
 EOF
   fi
 }
@@ -344,6 +379,43 @@ spec:
     path: clusters/ocp/config
   destination:
     server: https://kubernetes.default.svc
+    namespace: openshift-workload-availability
+  dependsOn:
+    - name: openshift-workload-operators-install
+  syncPolicy:
+    automated:
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m
+EOF
+
+  cat > "${apps_dir}/openshift-workload-operators-descheduler-config.yaml" <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: openshift-workload-operators-descheduler-config
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:ravishar-rh/operator-config-files.git
+    targetRevision: main
+    path: clusters/ocp/config-descheduler
+  destination:
+    server: https://kubernetes.default.svc
   dependsOn:
     - name: openshift-workload-operators-install
   syncPolicy:
@@ -368,6 +440,7 @@ kind: Kustomization
 resources:
   - openshift-workload-operators-install.yaml
   - openshift-workload-operators-config.yaml
+  - openshift-workload-operators-descheduler-config.yaml
 EOF
 
   cat > "${apps_dir}/root.yaml" <<'EOF'
@@ -412,6 +485,7 @@ extract_chart kube-descheduler-operator kube-descheduler \
   --set deschedulerConfig.enabled=true
 
 write_cluster_overlays "${DEFAULT_OPERATORS[@]}"
+patch_descheduler_config
 patch_config_sync_waves
 write_argocd_applications
 
@@ -424,6 +498,11 @@ if command -v kubectl >/dev/null 2>&1; then
   echo "validating clusters/ocp/config kustomize build"
   if ! kubectl kustomize "${CLUSTER_CONFIG}" | grep -q '^kind:'; then
     echo "kustomize build for clusters/ocp/config produced no resources" >&2
+    exit 1
+  fi
+  echo "validating clusters/ocp/config-descheduler kustomize build"
+  if ! kubectl kustomize "${CLUSTER_CONFIG_DESCHEDULER}" | grep -q '^kind:'; then
+    echo "kustomize build for clusters/ocp/config-descheduler produced no resources" >&2
     exit 1
   fi
   echo "validating argocd/applications kustomize build"

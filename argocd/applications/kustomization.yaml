@@ -3,3 +3,4 @@ kind: Kustomization
 resources:
   - openshift-workload-operators-install.yaml
   - openshift-workload-operators-config.yaml
+  - openshift-workload-operators-descheduler-config.yaml

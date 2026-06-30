@@ -40,14 +40,28 @@ Also creates shared Namespace and OperatorGroup resources (sync-waves 0 and 1).
 The OperatorGroup uses `spec: {}` (AllNamespaces mode) — do not set
 `targetNamespaces` to the same namespace or operator installs will fail.
 
-### Phase 2 — `clusters/ocp/config`
+### Phase 2 — config CRs (two Argo CD Applications)
 
-Argo CD Application: `openshift-workload-operators-config`
+`KubeDescheduler` is **cluster-scoped** (no namespace). Argo CD cannot deploy it
+in the same Application as namespaced CRs without reporting
+`InvalidSpecError: Namespace ... is missing`. Config is split into two apps:
+
+| Application | Path | Resources |
+|-------------|------|-----------|
+| `openshift-workload-operators-config` | `clusters/ocp/config` | SelfNodeRemediationTemplate, NodeHealthCheck |
+| `openshift-workload-operators-descheduler-config` | `clusters/ocp/config-descheduler` | KubeDescheduler/cluster (cluster-scoped) |
+
+**Workload config** (`clusters/ocp/config`):
 
 | Resource | Sync wave | Requires |
 |----------|-----------|----------|
 | `SelfNodeRemediationTemplate/self-node-remediation-resource-deletion-template` | 6 | Self-node-remediation operator CRD |
 | `NodeHealthCheck/nhc-all-linux-nodes` | 7 | Node-health-check operator CRD + SNR template above |
+
+**Descheduler config** (`clusters/ocp/config-descheduler`):
+
+| Resource | Sync wave | Requires |
+|----------|-----------|----------|
 | `KubeDescheduler/cluster` | 8 | Kube descheduler operator CRD |
 
 ## Why two Argo CD Applications?
@@ -155,7 +169,8 @@ This creates:
 |-------------|------|---------|
 | `operator-config-files-root` | `argocd/applications` | App-of-Apps parent |
 | `openshift-workload-operators-install` | `clusters/ocp/install` | OLM subscriptions |
-| `openshift-workload-operators-config` | `clusters/ocp/config` | Operator config CRs |
+| `openshift-workload-operators-config` | `clusters/ocp/config` | Workload operator config CRs |
+| `openshift-workload-operators-descheduler-config` | `clusters/ocp/config-descheduler` | KubeDescheduler (cluster-scoped) |
 
 Verify:
 
@@ -403,12 +418,14 @@ oc patch application operator-config-files-root -n openshift-gitops --type=json 
 
 # --- Step C: Delete child apps, then root app ---
 oc delete application openshift-workload-operators-config -n openshift-gitops --ignore-not-found --wait=false
+oc delete application openshift-workload-operators-descheduler-config -n openshift-gitops --ignore-not-found --wait=false
 oc delete application openshift-workload-operators-install -n openshift-gitops --ignore-not-found --wait=false
 oc delete application openshift-workload-operators -n openshift-gitops --ignore-not-found --wait=false
 oc delete application operator-config-files-root -n openshift-gitops --ignore-not-found --wait=false
 
 # --- Step D: Force-remove finalizers if any app is stuck Terminating ---
 for app in openshift-workload-operators-config \
+           openshift-workload-operators-descheduler-config \
            openshift-workload-operators-install \
            openshift-workload-operators \
            operator-config-files-root; do
@@ -417,7 +434,7 @@ for app in openshift-workload-operators-config \
 done
 
 # --- Step E: Verify all apps are gone ---
-oc get application -n openshift-gitops | rg -e 'workload|operator-config' || echo "All apps deleted"
+oc get application -n openshift-gitops | grep -E 'workload|operator-config' || echo "All apps deleted"
 ```
 
 If step D still leaves apps behind, check what is blocking:
@@ -450,7 +467,7 @@ oc get namespace openshift-workload-availability openshift-kube-descheduler-oper
 If a namespace is stuck in **Terminating**, check for remaining finalizers:
 
 ```sh
-oc get namespace openshift-workload-availability -o yaml | rg finalizers -A5
+oc get namespace openshift-workload-availability -o yaml | grep -A5 finalizers
 ```
 
 Then continue from [Fresh deploy checklist](#fresh-deploy-checklist).
@@ -519,7 +536,7 @@ oc get nodehealthcheck,selfnoderemediationtemplate -n openshift-workload-availab
 oc get kubedescheduler cluster 2>/dev/null
 
 echo "=== OperatorGroup (workload — spec must be empty for AllNamespaces) ==="
-oc get operatorgroup openshift-workload-availability -n openshift-workload-availability -o yaml 2>/dev/null | rg -A3 "^spec:"
+oc get operatorgroup openshift-workload-availability -n openshift-workload-availability -o yaml 2>/dev/null | grep -A3 '^spec:'
 ```
 
 Expected before fresh deploy: no subscriptions, no CSVs, no config CRs (Level 1),
@@ -608,13 +625,68 @@ The operator CRD is not registered yet. Check:
 ```sh
 oc get installplan -n openshift-workload-availability
 oc get csv -n openshift-workload-availability
-oc get crd | rg -i 'nodehealth|selfnoderemediation|kubedescheduler'
+oc get crd | grep -iE 'nodehealth|selfnoderemediation|kubedescheduler'
 ```
 
 Fix: approve InstallPlans in the order above, wait for CSV **Succeeded**, then
 re-sync the config Application.
 
-### KubeDescheduler not found
+### KubeDescheduler InvalidSpecError (namespace missing)
+
+```
+InvalidSpecError
+Namespace for cluster operator.openshift.io/v1, Kind=KubeDescheduler is missing.
+```
+
+**Cause:** `KubeDescheduler` is cluster-scoped (no `metadata.namespace`). Argo CD
+cannot mix it with namespaced CRs in one Application.
+
+**Fix in git:** descheduler config is in a separate path
+(`clusters/ocp/config-descheduler`) and Application
+(`openshift-workload-operators-descheduler-config`).
+
+**Fix on cluster** — pull latest git, refresh root app, then sync:
+
+```sh
+APP=operator-config-files-root
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main"}}}'
+
+oc get application openshift-workload-operators-descheduler-config -n openshift-gitops
+```
+
+Or apply directly while waiting for git sync:
+
+```sh
+oc apply -f kube-descheduler-operator/config/kube-descheduler-cluster.yaml
+```
+
+### KubeDescheduler profileCustomizations validation error
+
+```
+spec.profileCustomizations.devLowNodeUtilizationThresholds: must be of type string
+Supported values: "Low", "Medium", "High", ""
+```
+
+**Cause:** The upstream helm chart rendered an object (`thresholds`/`targetThresholds`).
+The OpenShift API expects a **string preset**:
+
+| Value | Underutilized | Overutilized |
+|-------|---------------|--------------|
+| `Low` | 10% | 30% |
+| `Medium` | 20% | 50% (default) |
+| `High` | 40% | 70% |
+
+**Fix:** use a string in `kube-descheduler-operator/config/kube-descheduler-cluster.yaml`:
+
+```yaml
+profileCustomizations:
+  devLowNodeUtilizationThresholds: Medium   # or Low, High
+```
+
+### KubeDescheduler not found (CRD missing)
 
 Same root cause — the descheduler operator CRD is not registered yet. This
 usually means InstallPlan step 4 was skipped or the CSV is still installing.
@@ -688,6 +760,7 @@ oc patch application operator-config-files-root -n openshift-gitops --type=json 
   -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]' 2>/dev/null || true
 
 for app in openshift-workload-operators-config \
+           openshift-workload-operators-descheduler-config \
            openshift-workload-operators-install \
            openshift-workload-operators \
            operator-config-files-root; do
@@ -752,6 +825,7 @@ Environment overrides:
 | `fence-agents-remediation-operator/config/secret-*.yaml` | Real BMC credentials |
 | `fence-agents-remediation-operator/config/fence-agents-*.yaml` | Node IPMI parameters |
 | `node-health-check-operator/config/node-health-check-*.yaml` | Narrow selector if needed |
+| `kube-descheduler-operator/config/kube-descheduler-cluster.yaml` | Set `devLowNodeUtilizationThresholds` to `Low`, `Medium`, or `High` |
 | `clusters/ocp/config/kustomization.yaml` | Pick remediation backend |
 
 ## Notes

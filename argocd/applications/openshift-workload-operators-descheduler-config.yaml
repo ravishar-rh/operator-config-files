@@ -1,10 +1,10 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: openshift-workload-operators-config
+  name: openshift-workload-operators-descheduler-config
   namespace: openshift-gitops
   annotations:
-    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/sync-wave: "2"
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -12,10 +12,9 @@ spec:
   source:
     repoURL: git@github.com:ravishar-rh/operator-config-files.git
     targetRevision: main
-    path: clusters/ocp/config
+    path: clusters/ocp/config-descheduler
   destination:
     server: https://kubernetes.default.svc
-    namespace: openshift-workload-availability
   dependsOn:
     - name: openshift-workload-operators-install
   syncPolicy:
