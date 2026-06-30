@@ -5,6 +5,4 @@ metadata:
   namespace: openshift-workload-availability
   annotations:
     argocd.argoproj.io/sync-wave: "1"
-spec:
-  targetNamespaces:
-    - openshift-workload-availability
+spec: {}

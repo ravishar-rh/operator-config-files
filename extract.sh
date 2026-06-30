@@ -248,6 +248,24 @@ resources:
 EOF
 }
 
+patch_operatorgroup_install_mode() {
+  local og="${BASE_DIR}/operatorgroup.yaml"
+  if [[ -f "${og}" ]]; then
+    # Empty spec = AllNamespaces. targetNamespaces matching the operator
+    # namespace triggers OwnNamespace, which these operators do not support.
+    cat > "${og}" <<'EOF'
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-workload-availability
+  namespace: openshift-workload-availability
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec: {}
+EOF
+  fi
+}
+
 patch_config_sync_waves() {
   local nhc="${OUT_DIR}/node-health-check-operator/config/node-health-check-nhc-all-linux-nodes.yaml"
   local kd="${OUT_DIR}/kube-descheduler-operator/config/kube-descheduler-cluster.yaml"
@@ -379,6 +397,7 @@ EOF
 }
 
 write_shared_base
+patch_operatorgroup_install_mode
 
 extract_chart node-maintenance-operator node-maintenance
 extract_chart self-node-remediation-operator self-node-remediation \

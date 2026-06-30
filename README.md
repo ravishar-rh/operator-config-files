@@ -37,6 +37,8 @@ Argo CD Application: `openshift-workload-operators-install`
 | `openshift-kube-descheduler-operator` | `cluster-kube-descheduler-operator` |
 
 Also creates shared Namespace and OperatorGroup resources (sync-waves 0 and 1).
+The OperatorGroup uses `spec: {}` (AllNamespaces mode) — do not set
+`targetNamespaces` to the same namespace or operator installs will fail.
 
 ### Phase 2 — `clusters/ocp/config`
 
@@ -62,6 +64,9 @@ Phase 1 applies subscriptions. Phase 2 applies config CRs after phase 1 syncs,
 with unlimited retry until CRDs exist.
 
 ## Deployment guide
+
+If a previous attempt failed, start with
+[Clean up and restart from scratch](#clean-up-and-restart-from-scratch) first.
 
 ### Prerequisites
 
@@ -128,64 +133,6 @@ oc create secret generic repo-operator-config-files \
 oc label secret repo-operator-config-files \
   -n openshift-gitops \
   argocd.argoproj.io/secret-type=repository
-```
-
-## OpenShift GitOps helpers (`oc` only)
-
-Use these instead of the `argocd` CLI for common operations.
-
-### Check Application status
-
-```sh
-oc get applications -n openshift-gitops
-
-oc get application openshift-workload-operators-install -n openshift-gitops \
-  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
-
-oc get application openshift-workload-operators-config -n openshift-gitops \
-  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
-```
-
-### Refresh an Application (pull latest git commit)
-
-```sh
-APP=openshift-workload-operators-config
-
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
-```
-
-### Sync an Application
-
-```sh
-APP=openshift-workload-operators-config
-
-# Trigger sync
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main"}}}'
-
-# Watch until sync completes
-watch oc get application "${APP}" -n openshift-gitops \
-  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
-```
-
-### Force sync (when resources are stuck OutOfSync)
-
-```sh
-APP=openshift-workload-operators-config
-
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
-
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main","syncStrategy":{"apply":{"force":true}},"prune":true}}}'
-```
-
-### Open Argo CD UI in browser (optional)
-
-```sh
-oc get route openshift-gitops-server -n openshift-gitops \
-  -o jsonpath='https://{.spec.host}{"\n"}'
 ```
 
 ### Step 2 — Remove old Application (if upgrading)
@@ -355,7 +302,276 @@ Apply root.yaml
         KubeDescheduler (wave 8)
 ```
 
+## Clean up and restart from scratch
+
+Use this when operators are stuck in **Failed**, InstallPlans were approved in
+the wrong order, the OperatorGroup is misconfigured, or config CRs will not sync.
+All commands use `oc` only.
+
+Clone or `cd` to this repo on a machine with cluster access before running the
+`oc apply` steps below.
+
+### When to use which reset
+
+| Situation | Reset level |
+|-----------|-------------|
+| One CSV failed, others fine | [Level 1 — operators only](#level-1-reset-operators-keep-argocd) |
+| OwnNamespace / OperatorGroup error | [Level 1](#level-1-reset-operators-keep-argocd) |
+| Multiple failed CSVs, bad InstallPlan order | [Level 1](#level-1-reset-operators-keep-argocd) |
+| Argo CD apps OutOfSync / stuck operations | [Level 2 — full reset](#level-2-full-reset-including-argocd-apps) |
+| Namespaces corrupted or want completely clean slate | [Level 3 — delete namespaces](#level-3-delete-namespaces-nuclear) |
+
+---
+
+### Level 1 — Reset operators (keep Argo CD)
+
+Removes OLM state and config CRs. Keeps Argo CD Applications, namespaces, and
+OperatorGroups. Use this for most recovery scenarios.
+
+```sh
+# --- Phase 2: config CRs ---
+oc delete nodehealthcheck --all -n openshift-workload-availability --ignore-not-found
+oc delete selfnoderemediationtemplate --all -n openshift-workload-availability --ignore-not-found
+oc delete kubedescheduler cluster --ignore-not-found
+
+# --- Phase 1: OLM (workload-availability namespace) ---
+oc delete subscription --all -n openshift-workload-availability
+oc delete csv --all -n openshift-workload-availability
+oc delete installplan --all -n openshift-workload-availability
+
+# --- Phase 1: OLM (descheduler namespace) ---
+oc delete subscription --all -n openshift-kube-descheduler-operator
+oc delete csv --all -n openshift-kube-descheduler-operator
+oc delete installplan --all -n openshift-kube-descheduler-operator
+
+# --- Fix OperatorGroup (AllNamespaces mode — required for these operators) ---
+oc delete operatorgroup openshift-workload-availability -n openshift-workload-availability --ignore-not-found
+oc apply -f base/openshift-workload-availability/operatorgroup.yaml
+
+# --- Re-sync from git ---
+APP=openshift-workload-operators-install
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main"}}}'
+
+APP=openshift-workload-operators-config
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+```
+
+Then continue from [Step 5 — Approve InstallPlans](#step-5--approve-installplans-in-order).
+
+---
+
+### Level 2 — Full reset (including Argo CD apps)
+
+Deletes Argo CD Applications and all operator resources, then redeploys from git.
+Use when Argo CD itself is stuck or Level 1 did not clear the failure.
+
+```sh
+# 1. Delete Argo CD Applications (child apps first)
+oc delete application openshift-workload-operators-config -n openshift-gitops --ignore-not-found
+oc delete application openshift-workload-operators-install -n openshift-gitops --ignore-not-found
+oc delete application operator-config-files-root -n openshift-gitops --ignore-not-found
+oc delete application openshift-workload-operators -n openshift-gitops --ignore-not-found
+
+# 2. Delete all operator and config resources
+oc delete nodehealthcheck --all -n openshift-workload-availability --ignore-not-found
+oc delete selfnoderemediationtemplate --all -n openshift-workload-availability --ignore-not-found
+oc delete kubedescheduler cluster --ignore-not-found
+
+oc delete subscription --all -n openshift-workload-availability --ignore-not-found
+oc delete csv --all -n openshift-workload-availability --ignore-not-found
+oc delete installplan --all -n openshift-workload-availability --ignore-not-found
+oc delete operatorgroup --all -n openshift-workload-availability --ignore-not-found
+
+oc delete subscription --all -n openshift-kube-descheduler-operator --ignore-not-found
+oc delete csv --all -n openshift-kube-descheduler-operator --ignore-not-found
+oc delete installplan --all -n openshift-kube-descheduler-operator --ignore-not-found
+oc delete operatorgroup --all -n openshift-kube-descheduler-operator --ignore-not-found
+
+# 3. Verify clean
+oc get subscription,csv,installplan,operatorgroup \
+  -n openshift-workload-availability
+oc get subscription,csv,installplan,operatorgroup \
+  -n openshift-kube-descheduler-operator
+oc get applications -n openshift-gitops | rg workload || true
+```
+
+Then continue from [Fresh deploy checklist](#fresh-deploy-checklist).
+
+---
+
+### Level 3 — Delete namespaces (nuclear)
+
+Removes everything including namespaces. Only use when namespaces are corrupted
+or you need a completely empty starting point. **This removes all resources in
+those namespaces.**
+
+```sh
+# Run Level 2 first (delete Argo CD apps + OLM resources)
+# Then delete namespaces:
+oc delete namespace openshift-workload-availability --ignore-not-found
+oc delete namespace openshift-kube-descheduler-operator --ignore-not-found
+
+# Wait for namespaces to terminate
+oc get namespace openshift-workload-availability openshift-kube-descheduler-operator
+```
+
+If a namespace is stuck in **Terminating**, check for remaining finalizers:
+
+```sh
+oc get namespace openshift-workload-availability -o yaml | rg finalizers -A5
+```
+
+Then continue from [Fresh deploy checklist](#fresh-deploy-checklist).
+
+---
+
+### Fresh deploy checklist
+
+After any reset level, follow these steps in order:
+
+```sh
+# 1. Confirm git repo is registered in Argo CD
+oc get secret -n openshift-gitops -l argocd.argoproj.io/secret-type=repository
+
+# 2. Bootstrap Argo CD Applications (from repo checkout)
+oc apply -f argocd/applications/root.yaml
+
+# 3. Wait for install app to sync
+watch oc get application openshift-workload-operators-install -n openshift-gitops \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+
+# 4. Confirm subscriptions exist
+oc get subscription -n openshift-workload-availability
+oc get subscription -n openshift-kube-descheduler-operator
+
+# 5. Approve InstallPlans ONE AT A TIME (see Step 5 below)
+# 6. Verify CRDs exist (Step 6)
+# 7. Sync config app (Step 7)
+```
+
+**InstallPlan approval order** (wait for CSV **Succeeded** between each):
+
+| Order | Operator | Namespace |
+|-------|----------|-----------|
+| 1 | `node-maintenance-operator` | `openshift-workload-availability` |
+| 2 | `self-node-remediation` | `openshift-workload-availability` |
+| 3 | `node-healthcheck-operator` | `openshift-workload-availability` |
+| 4 | `cluster-kube-descheduler-operator` | `openshift-kube-descheduler-operator` |
+
+```sh
+# Approve one plan at a time:
+oc get installplan -n openshift-workload-availability
+oc patch installplan <installplan-name> -n openshift-workload-availability \
+  --type merge -p '{"spec":{"approved":true}}'
+watch oc get csv -n openshift-workload-availability
+```
+
+---
+
+### Verify clean state before redeploying
+
+```sh
+echo "=== Argo CD ==="
+oc get applications -n openshift-gitops
+
+echo "=== Subscriptions ==="
+oc get subscription -n openshift-workload-availability 2>/dev/null
+oc get subscription -n openshift-kube-descheduler-operator 2>/dev/null
+
+echo "=== CSVs ==="
+oc get csv -n openshift-workload-availability 2>/dev/null
+oc get csv -n openshift-kube-descheduler-operator 2>/dev/null
+
+echo "=== Config CRs ==="
+oc get nodehealthcheck,selfnoderemediationtemplate -n openshift-workload-availability 2>/dev/null
+oc get kubedescheduler cluster 2>/dev/null
+
+echo "=== OperatorGroup (workload — spec must be empty for AllNamespaces) ==="
+oc get operatorgroup openshift-workload-availability -n openshift-workload-availability -o yaml 2>/dev/null | rg -A3 "^spec:"
+```
+
+Expected before fresh deploy: no subscriptions, no CSVs, no config CRs (Level 1),
+or no applications either (Level 2+). OperatorGroup `spec: {}` with no
+`targetNamespaces`.
+
+## OpenShift GitOps helpers (`oc` only)
+
+Use these instead of the `argocd` CLI for common operations.
+
+### Check Application status
+
+```sh
+oc get applications -n openshift-gitops
+
+oc get application openshift-workload-operators-install -n openshift-gitops \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+
+oc get application openshift-workload-operators-config -n openshift-gitops \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+```
+
+### Refresh an Application (pull latest git commit)
+
+```sh
+APP=openshift-workload-operators-config
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+```
+
+### Sync an Application
+
+```sh
+APP=openshift-workload-operators-config
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main"}}}'
+
+watch oc get application "${APP}" -n openshift-gitops \
+  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+```
+
+### Force sync (when resources are stuck OutOfSync)
+
+```sh
+APP=openshift-workload-operators-config
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main","syncStrategy":{"apply":{"force":true}},"prune":true}}}'
+```
+
+### Open Argo CD UI in browser (optional)
+
+```sh
+oc get route openshift-gitops-server -n openshift-gitops \
+  -o jsonpath='https://{.spec.host}{"\n"}'
+```
+
 ## Troubleshooting
+
+### OwnNamespace InstallModeType not supported
+
+```
+Operator failed
+OwnNamespace InstallModeType not supported, cannot configure to watch own namespace
+```
+
+**Cause:** The OperatorGroup had `targetNamespaces` set to the same namespace
+(`openshift-workload-availability`). OLM interprets that as **OwnNamespace**
+install mode, but the node maintenance / remediation / health check operators
+require **AllNamespaces** mode.
+
+**Fix in git:** `base/openshift-workload-availability/operatorgroup.yaml` uses
+`spec: {}` (no `targetNamespaces`).
+
+**Fix on cluster:** follow [Level 1 — Reset operators](#level-1-reset-operators-keep-argocd).
 
 ### NodeHealthCheck / SelfNodeRemediationTemplate not found
 
