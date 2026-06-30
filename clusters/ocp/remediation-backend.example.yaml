@@ -1,0 +1,10 @@
+# Example: swap self-node-remediation for fence-agents-remediation.
+#
+# 1. Edit clusters/ocp/kustomization.yaml
+# 2. Replace:
+#      - ../../self-node-remediation-operator
+#    with:
+#      - ../../fence-agents-remediation-operator
+# 3. Update fence-agents-remediation-operator/config/secret-fence-agents-credentials-shared.yaml
+# 4. Update node-health-check-operator/config/node-health-check-nhc-all-linux-nodes.yaml
+#    remediationTemplate to point at the FAR template if needed.

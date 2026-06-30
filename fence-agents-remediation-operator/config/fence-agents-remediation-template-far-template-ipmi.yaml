@@ -1,0 +1,25 @@
+apiVersion: fence-agents-remediation.medik8s.io/v1alpha1
+kind: FenceAgentsRemediationTemplate
+metadata:
+  name: far-template-ipmi
+  namespace: openshift-workload-availability
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  template:
+    spec:
+      agent: fence_ipmilan
+      nodeparameters:
+        worker-0.example.com:
+          ipaddr: 192.0.2.10
+          plug: "1"
+      remediationStrategy: ResourceDeletion
+      retrycount: 5
+      retryinterval: 5s
+      sharedSecretName: fence-agents-credentials-shared
+      sharedparameters:
+        ipport: "623"
+        lanplus: "1"
+        pcmk_host_check: static-list
+      timeout: 60s

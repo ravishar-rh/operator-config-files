@@ -1,0 +1,28 @@
+apiVersion: remediation.medik8s.io/v1alpha1
+kind: NodeHealthCheck
+metadata:
+  name: nhc-all-linux-nodes
+  namespace: openshift-workload-availability
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  minHealthy: "51%"
+  selector:
+    matchExpressions:
+    - key: kubernetes.io/os
+      operator: In
+      values:
+      - linux
+  unhealthyConditions:
+    - duration: 300s
+      status: "False"
+      type: Ready
+    - duration: 300s
+      status: Unknown
+      type: Ready
+  remediationTemplate:
+    apiVersion: self-node-remediation.medik8s.io/v1alpha1
+    kind: SelfNodeRemediationTemplate
+    name: self-node-remediation-resource-deletion-template
+    namespace: openshift-workload-availability
