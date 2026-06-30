@@ -250,8 +250,12 @@ EOF
 
 patch_config_sync_waves() {
   local nhc="${OUT_DIR}/node-health-check-operator/config/node-health-check-nhc-all-linux-nodes.yaml"
+  local kd="${OUT_DIR}/kube-descheduler-operator/config/kube-descheduler-cluster.yaml"
   if [[ -f "${nhc}" ]]; then
     sed -i '' 's/argocd.argoproj.io\/sync-wave: "6"/argocd.argoproj.io\/sync-wave: "7"/' "${nhc}"
+  fi
+  if [[ -f "${kd}" ]]; then
+    sed -i '' 's/argocd.argoproj.io\/sync-wave: "5"/argocd.argoproj.io\/sync-wave: "8"/' "${kd}"
   fi
 }
 

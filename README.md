@@ -44,9 +44,9 @@ Argo CD Application: `openshift-workload-operators-config`
 
 | Resource | Sync wave | Requires |
 |----------|-----------|----------|
-| `KubeDescheduler/cluster` | 5 | Descheduler operator CRD |
 | `SelfNodeRemediationTemplate/self-node-remediation-resource-deletion-template` | 6 | Self-node-remediation operator CRD |
 | `NodeHealthCheck/nhc-all-linux-nodes` | 7 | Node-health-check operator CRD + SNR template above |
+| `KubeDescheduler/cluster` | 8 | Kube descheduler operator CRD |
 
 ## Why two Argo CD Applications?
 
@@ -314,9 +314,9 @@ Apply root.yaml
     → Approve: cluster-kube-descheduler-operator (wait for CSV Succeeded)
   → All CRDs Established
     → Config app syncs:
-        KubeDescheduler (wave 5)
         SelfNodeRemediationTemplate (wave 6)
         NodeHealthCheck (wave 7)
+        KubeDescheduler (wave 8)
 ```
 
 ## Troubleshooting
@@ -333,6 +333,32 @@ oc get crd | rg -i 'nodehealth|selfnoderemediation|kubedescheduler'
 
 Fix: approve InstallPlans in the order above, wait for CSV **Succeeded**, then
 re-sync the config Application.
+
+### KubeDescheduler not found
+
+Same root cause — the descheduler operator CRD is not registered yet. This
+usually means InstallPlan step 4 was skipped or the CSV is still installing.
+
+```sh
+oc get installplan -n openshift-kube-descheduler-operator
+oc get csv -n openshift-kube-descheduler-operator
+oc get crd kubedeschedulers.operator.openshift.io
+```
+
+Fix:
+
+```sh
+# Approve the descheduler InstallPlan if still pending
+oc patch installplan <installplan-name> -n openshift-kube-descheduler-operator \
+  --type merge -p '{"spec":{"approved":true}}'
+
+# Wait for CSV Succeeded, then re-sync config
+watch oc get csv -n openshift-kube-descheduler-operator
+argocd app sync openshift-workload-operators-config --force
+```
+
+The config app retries automatically, but only succeeds once the descheduler
+CSV completes and the CRD is **Established**.
 
 ### Config app stuck OutOfSync
 
