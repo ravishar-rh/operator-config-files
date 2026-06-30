@@ -18,8 +18,35 @@ Repository: https://github.com/ravishar-rh/operator-config-files
 ├── self-node-remediation-operator/
 ├── node-health-check-operator/
 ├── kube-descheduler-operator/
+├── fence-agents-remediation-operator/   # Optional — not in default overlay
+├── machine-deletion-remediation-operator/ # Optional — not in default overlay
 └── extract.sh
 ```
+
+## What gets deployed
+
+### Phase 1 — `clusters/ocp/install`
+
+Argo CD Application: `openshift-workload-operators-install`
+
+| Namespace | Subscription (operator package) |
+|-----------|--------------------------------|
+| `openshift-workload-availability` | `node-maintenance-operator` |
+| `openshift-workload-availability` | `self-node-remediation` |
+| `openshift-workload-availability` | `node-healthcheck-operator` |
+| `openshift-kube-descheduler-operator` | `cluster-kube-descheduler-operator` |
+
+Also creates shared Namespace and OperatorGroup resources (sync-waves 0 and 1).
+
+### Phase 2 — `clusters/ocp/config`
+
+Argo CD Application: `openshift-workload-operators-config`
+
+| Resource | Sync wave | Requires |
+|----------|-----------|----------|
+| `KubeDescheduler/cluster` | 5 | Descheduler operator CRD |
+| `SelfNodeRemediationTemplate/self-node-remediation-resource-deletion-template` | 6 | Self-node-remediation operator CRD |
+| `NodeHealthCheck/nhc-all-linux-nodes` | 7 | Node-health-check operator CRD + SNR template above |
 
 ## Why two Argo CD Applications?
 
@@ -31,27 +58,48 @@ install completes. If config CRs sync in the same Application, Argo CD reports:
 Resource not found in cluster: remediation.medik8s.io/v1alpha1/NodeHealthCheck:nhc-all-linux-nodes
 ```
 
-Phase 1 (`openshift-workload-operators-install`) applies subscriptions.
-Phase 2 (`openshift-workload-operators-config`) applies config CRs after phase 1
-syncs, with unlimited retry until CRDs exist.
+Phase 1 applies subscriptions. Phase 2 applies config CRs after phase 1 syncs,
+with unlimited retry until CRDs exist.
 
-## Default stack
+## Deployment guide
 
-**Install** (`clusters/ocp/install`):
+### Prerequisites
 
-- Shared namespace + operator group
-- Subscriptions: node-maintenance, self-node-remediation, node-health-check,
-  kube-descheduler
+```sh
+# Logged in to your cluster
+oc whoami
 
-**Config** (`clusters/ocp/config`):
+# OpenShift GitOps (Argo CD) installed
+oc get ns openshift-gitops
+oc get pods -n openshift-gitops
+```
 
-- SelfNodeRemediationTemplate (sync-wave 6)
-- NodeHealthCheck (sync-wave 7)
-- KubeDescheduler CR (sync-wave 5)
+### Step 1 — Push repo to GitHub
 
-## Argo CD bootstrap
+```sh
+cd /path/to/operator-config-files
+git push origin main
+```
 
-Prerequisite: OpenShift GitOps (Argo CD) in `openshift-gitops`.
+Argo CD Applications use SSH: `git@github.com:ravishar-rh/operator-config-files.git`
+
+Configure Argo CD with SSH access to GitHub before bootstrapping:
+
+- **Argo CD UI** → Settings → Repositories → Connect repo (via SSH), or
+- **CLI**: `argocd repo add git@github.com:ravishar-rh/operator-config-files.git --ssh-private-key-path ~/.ssh/id_ed25519`
+
+Alternatively, change `repoURL` in the Application CRs to HTTPS if SSH is not
+configured in Argo CD.
+
+### Step 2 — Remove old Application (if upgrading)
+
+If you previously deployed the single-app layout:
+
+```sh
+oc delete application openshift-workload-operators -n openshift-gitops --ignore-not-found
+```
+
+### Step 3 — Bootstrap Argo CD Applications
 
 ```sh
 oc apply -f argocd/applications/root.yaml
@@ -61,39 +109,148 @@ This creates:
 
 | Application | Path | Purpose |
 |-------------|------|---------|
+| `operator-config-files-root` | `argocd/applications` | App-of-Apps parent |
 | `openshift-workload-operators-install` | `clusters/ocp/install` | OLM subscriptions |
 | `openshift-workload-operators-config` | `clusters/ocp/config` | Operator config CRs |
 
-If upgrading from the single-app layout, delete the old Application first:
+Verify:
 
 ```sh
-oc delete application openshift-workload-operators -n openshift-gitops
-oc apply -f argocd/applications/root.yaml
+oc get applications -n openshift-gitops
 ```
 
-## Deployment workflow
+### Step 4 — Confirm Phase 1 sync
 
-1. **Sync install app** — confirm subscriptions exist in Argo CD.
-2. **Approve InstallPlans** (required — subscriptions use `Manual` approval):
+The install app uses automated sync. Confirm it is **Synced/Healthy**:
 
-   ```sh
-   oc get installplan -n openshift-workload-availability
-   oc patch installplan <name> -n openshift-workload-availability \
-     --type merge -p '{"spec":{"approved":true}}'
-   ```
+```sh
+oc get application openshift-workload-operators-install -n openshift-gitops
+oc get subscription -n openshift-workload-availability
+oc get subscription -n openshift-kube-descheduler-operator
+```
 
-   Repeat for `openshift-kube-descheduler-operator` if needed.
+Pending InstallPlans should appear:
 
-3. **Wait for operators**:
+```sh
+oc get installplan -n openshift-workload-availability
+oc get installplan -n openshift-kube-descheduler-operator
+```
 
-   ```sh
-   oc get csv -n openshift-workload-availability
-   oc get crd nodehealthchecks.remediation.medik8s.io
-   oc get crd selfnoderemediationtemplates.self-node-remediation.medik8s.io
-   ```
+### Step 5 — Approve InstallPlans (in order)
 
-4. **Sync config app** — Argo CD retries automatically; or click Sync on
-   `openshift-workload-operators-config` once CRDs show `Established`.
+All subscriptions use `installPlanApproval: Manual`. Approve **one at a time**
+and wait for each CSV to reach **Succeeded** before approving the next.
+
+Do not approve all InstallPlans at once. Config CRs need operator CRDs first —
+especially `self-node-remediation` before `node-healthcheck-operator`, because
+`NodeHealthCheck` references the `SelfNodeRemediationTemplate`.
+
+#### 1. Node Maintenance Operator
+
+```sh
+oc get installplan -n openshift-workload-availability
+
+oc patch installplan <installplan-name> -n openshift-workload-availability \
+  --type merge -p '{"spec":{"approved":true}}'
+
+oc get csv -n openshift-workload-availability | grep node-maintenance
+watch oc get csv -n openshift-workload-availability
+```
+
+Wait until the node-maintenance CSV shows **Succeeded**.
+
+#### 2. Self Node Remediation Operator
+
+Required before the remediation template and NodeHealthCheck config.
+
+```sh
+oc get installplan -n openshift-workload-availability
+
+oc patch installplan <installplan-name> -n openshift-workload-availability \
+  --type merge -p '{"spec":{"approved":true}}'
+
+oc get csv -n openshift-workload-availability | grep self-node-remediation
+```
+
+Wait until the self-node-remediation CSV shows **Succeeded**.
+
+#### 3. Node Health Check Operator
+
+```sh
+oc get installplan -n openshift-workload-availability
+
+oc patch installplan <installplan-name> -n openshift-workload-availability \
+  --type merge -p '{"spec":{"approved":true}}'
+
+oc get csv -n openshift-workload-availability | grep node-healthcheck
+```
+
+Wait until the node-healthcheck CSV shows **Succeeded**.
+
+#### 4. Kube Descheduler Operator
+
+Separate namespace. Can run after step 1; safest to approve last.
+
+```sh
+oc get installplan -n openshift-kube-descheduler-operator
+
+oc patch installplan <installplan-name> -n openshift-kube-descheduler-operator \
+  --type merge -p '{"spec":{"approved":true}}'
+
+oc get csv -n openshift-kube-descheduler-operator
+```
+
+Wait until the descheduler CSV shows **Succeeded**.
+
+### Step 6 — Verify CRDs exist
+
+Before Phase 2 can succeed, confirm CRDs are registered:
+
+```sh
+oc get crd selfnoderemediationtemplates.self-node-remediation.medik8s.io
+oc get crd nodehealthchecks.remediation.medik8s.io
+oc get crd kubedeschedulers.operator.openshift.io
+```
+
+All should exist and be **Established**.
+
+### Step 7 — Confirm Phase 2 sync
+
+The config app depends on the install app and retries until CRDs exist.
+
+```sh
+oc get application openshift-workload-operators-config -n openshift-gitops
+```
+
+If still failing after all CSVs are Succeeded, force a sync:
+
+```sh
+argocd app sync openshift-workload-operators-config --force
+```
+
+Verify config resources:
+
+```sh
+oc get selfnoderemediationtemplate -n openshift-workload-availability
+oc get nodehealthcheck -n openshift-workload-availability
+oc get kubedescheduler cluster
+```
+
+### Deployment flow
+
+```
+Apply root.yaml
+  → Install app syncs subscriptions
+    → Approve: node-maintenance-operator (wait for CSV Succeeded)
+    → Approve: self-node-remediation (wait for CSV Succeeded)
+    → Approve: node-healthcheck-operator (wait for CSV Succeeded)
+    → Approve: cluster-kube-descheduler-operator (wait for CSV Succeeded)
+  → All CRDs Established
+    → Config app syncs:
+        KubeDescheduler (wave 5)
+        SelfNodeRemediationTemplate (wave 6)
+        NodeHealthCheck (wave 7)
+```
 
 ## Troubleshooting
 
@@ -102,18 +259,13 @@ oc apply -f argocd/applications/root.yaml
 The operator CRD is not registered yet. Check:
 
 ```sh
-# InstallPlan still pending?
 oc get installplan -n openshift-workload-availability
-
-# CSV not yet succeeded?
 oc get csv -n openshift-workload-availability
-
-# CRD missing?
 oc get crd | rg -i 'nodehealth|selfnoderemediation|kubedescheduler'
 ```
 
-Fix: approve InstallPlans, wait for CSV `Succeeded`, then re-sync the config
-Application.
+Fix: approve InstallPlans in the order above, wait for CSV **Succeeded**, then
+re-sync the config Application.
 
 ### Config app stuck OutOfSync
 
@@ -123,10 +275,23 @@ Hard refresh the config app in Argo CD UI, or:
 argocd app sync openshift-workload-operators-config --force
 ```
 
+### Argo CD cannot reach GitHub repo
+
+Confirm the repo is registered in Argo CD with a valid SSH key or switch
+Application `repoURL` to HTTPS.
+
 ## Remediation backend
 
-Edit `clusters/ocp/config/kustomization.yaml` to swap remediation operators.
-See `clusters/ocp/remediation-backend.example.yaml`.
+The default overlay uses `self-node-remediation-operator`. To swap backends,
+edit `clusters/ocp/config/kustomization.yaml` and replace
+`self-node-remediation-operator/config` with one of:
+
+- `fence-agents-remediation-operator/config`
+- `machine-deletion-remediation-operator/config`
+
+See `clusters/ocp/remediation-backend.example.yaml` for details. If you switch
+backends, update the `remediationTemplate` reference in the NodeHealthCheck
+config to match.
 
 ## Local validation
 
@@ -138,15 +303,23 @@ kubectl kustomize clusters/ocp          # full stack (local only)
 
 ## Regenerate from Helm charts
 
+After editing upstream `values.yaml` in `~/Downloads/gitops`:
+
 ```sh
 ./extract.sh
 ```
+
+Environment overrides:
+
+- `GITOPS` — path to extracted charts (default: `~/Downloads/gitops`)
+- `HELM` — path to the `helm` binary
 
 ## Site-specific edits
 
 | File | Action |
 |------|--------|
 | `fence-agents-remediation-operator/config/secret-*.yaml` | Real BMC credentials |
+| `fence-agents-remediation-operator/config/fence-agents-*.yaml` | Node IPMI parameters |
 | `node-health-check-operator/config/node-health-check-*.yaml` | Narrow selector if needed |
 | `clusters/ocp/config/kustomization.yaml` | Pick remediation backend |
 
@@ -155,3 +328,4 @@ kubectl kustomize clusters/ocp          # full stack (local only)
 - Subscriptions ignore OLM-managed `status` and `startingCSV` drift in Argo CD.
 - Do not commit production secrets — use Sealed Secrets or External Secrets.
 - `machine-deletion-remediation-operator` only applies on Machine API clusters.
+- `kube-descheduler-operator` uses namespace `openshift-kube-descheduler-operator`.
