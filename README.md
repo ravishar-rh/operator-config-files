@@ -93,6 +93,19 @@ oc get ns openshift-gitops
 oc get pods -n openshift-gitops
 ```
 
+Grant the Argo CD application controller permission to create operator config
+CRs (required once per cluster):
+
+```sh
+oc apply -f argocd/rbac/workload-operators-argocd-rbac.yaml
+
+# Verify permission
+oc auth can-i patch selfnoderemediationtemplates \
+  --as=system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller \
+  -n openshift-workload-availability
+# Expected: yes
+```
+
 ### Step 1 — Push repo to GitHub
 
 ```sh
@@ -281,16 +294,12 @@ The config app depends on the install app and retries until CRDs exist.
 oc get application openshift-workload-operators-config -n openshift-gitops
 ```
 
-If still failing after all CSVs are Succeeded, refresh and sync the config app:
+If still failing after all CSVs are Succeeded:
 
 ```sh
-APP=openshift-workload-operators-config
-
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
-
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main","syncStrategy":{"apply":{"force":true}},"prune":true}}}'
+./scripts/apply-workload-config.sh
+# or
+./scripts/sync-application.sh openshift-workload-operators-config
 ```
 
 Verify config resources:
@@ -364,15 +373,7 @@ oc delete operatorgroup openshift-workload-availability -n openshift-workload-av
 oc apply -f base/openshift-workload-availability/operatorgroup.yaml
 
 # --- Re-sync from git ---
-APP=openshift-workload-operators-install
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main"}}}'
-
-APP=openshift-workload-operators-config
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+./scripts/sync-application.sh openshift-workload-operators-install
 ```
 
 Then continue from [Step 5 — Approve InstallPlans](#step-5--approve-installplans-in-order).
@@ -568,28 +569,85 @@ oc patch application "${APP}" -n openshift-gitops --type merge \
   -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
 ```
 
-### Sync an Application
+### Sync an Application (correct `oc` method)
+
+The `operation` field is **top-level** on the Application (not under `spec`).
+Use `syncStrategy.hook` or `syncStrategy.apply` — not `revision` alone.
+
+Helper script (recommended):
+
+```sh
+./scripts/sync-application.sh openshift-workload-operators-config
+FORCE=true ./scripts/sync-application.sh openshift-workload-operators-config
+```
+
+Manual equivalent:
 
 ```sh
 APP=openshift-workload-operators-config
 
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main"}}}'
+# Clear stuck operation from a previous failed sync
+oc patch application "${APP}" -n openshift-gitops --type json \
+  -p='[{"op":"remove","path":"/operation"}]' 2>/dev/null || true
 
-watch oc get application "${APP}" -n openshift-gitops \
-  -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
+oc patch application "${APP}" -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+
+oc patch application "${APP}" -n openshift-gitops --type merge -p '{
+  "operation": {
+    "initiatedBy": {"username": "oc"},
+    "sync": {
+      "syncStrategy": {"hook": {}}
+    }
+  }
+}'
+```
+
+Check result:
+
+```sh
+oc get application "${APP}" -n openshift-gitops \
+  -o jsonpath='sync={.status.sync.status} health={.status.health.status} op={.status.operationState.phase}{"\n"}message={.status.operationState.message}{"\n"}'
 ```
 
 ### Force sync (when resources are stuck OutOfSync)
 
 ```sh
+FORCE=true ./scripts/sync-application.sh openshift-workload-operators-config
+```
+
+Or manually:
+
+```sh
 APP=openshift-workload-operators-config
 
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+oc patch application "${APP}" -n openshift-gitops --type json \
+  -p='[{"op":"remove","path":"/operation"}]' 2>/dev/null || true
 
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main","syncStrategy":{"apply":{"force":true}},"prune":true}}}'
+oc patch application "${APP}" -n openshift-gitops --type merge -p '{
+  "operation": {
+    "initiatedBy": {"username": "oc"},
+    "sync": {
+      "syncStrategy": {"apply": {"force": true}}
+    }
+  }
+}'
+```
+
+### Bypass Argo CD — apply config directly with `oc`
+
+When operators and CRDs are healthy but Argo CD will not sync, apply from git
+then refresh the app:
+
+```sh
+./scripts/apply-workload-config.sh
+```
+
+Or manually:
+
+```sh
+oc apply -k clusters/ocp/config
+oc get selfnoderemediationtemplate,nodehealthcheck -n openshift-workload-availability
 ```
 
 ### Open Argo CD UI in browser (optional)
@@ -629,7 +687,71 @@ oc get crd | grep -iE 'nodehealth|selfnoderemediation|kubedescheduler'
 ```
 
 Fix: approve InstallPlans in the order above, wait for CSV **Succeeded**, then
-re-sync the config Application.
+sync using [Sync an Application](#sync-an-application-correct-oc-method) or
+[apply config directly](#bypass-argocd--apply-config-directly-with-oc).
+
+### Argo CD forbidden — cannot patch operator config CRs
+
+```
+User "system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller"
+cannot patch resource "selfnoderemediationtemplates" ...
+```
+
+**Cause:** OpenShift GitOps application controller lacks RBAC for Medik8s/OpenShift
+operator config CRDs.
+
+**Fix:**
+
+```sh
+oc apply -f argocd/rbac/workload-operators-argocd-rbac.yaml
+
+oc auth can-i patch selfnoderemediationtemplates \
+  --as=system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller \
+  -n openshift-workload-availability
+
+./scripts/sync-application.sh openshift-workload-operators-config
+```
+
+### Config CRs still Missing after CSVs Succeeded
+
+Operators and CRDs are ready but Argo CD shows **OutOfSync / Missing**. This
+usually means a previous sync failed and the `operation` field is stuck, or the
+sync patch format was wrong.
+
+**Step 1 — confirm CRDs and CSVs (you already have these):**
+
+```sh
+oc get csv -n openshift-workload-availability
+oc get crd selfnoderemediationtemplates.self-node-remediation.medik8s.io
+oc get crd nodehealthchecks.remediation.medik8s.io
+```
+
+**Step 2 — apply config directly (fastest fix):**
+
+```sh
+cd ~/Development/operator-config-files
+./scripts/apply-workload-config.sh
+```
+
+**Step 3 — if direct apply fails, capture the real error:**
+
+```sh
+oc apply -k clusters/ocp/config
+```
+
+**Step 4 — if direct apply works but Argo CD stays OutOfSync, trigger sync:**
+
+```sh
+./scripts/sync-application.sh openshift-workload-operators-config
+```
+
+**Step 5 — read Argo CD failure message if sync still fails:**
+
+```sh
+oc get application openshift-workload-operators-config -n openshift-gitops \
+  -o jsonpath='{.status.operationState.message}{"\n"}'
+oc get application openshift-workload-operators-config -n openshift-gitops -o yaml | tail -40
+```
 
 ### KubeDescheduler InvalidSpecError (namespace missing)
 
@@ -648,12 +770,7 @@ cannot mix it with namespaced CRs in one Application.
 **Fix on cluster** — pull latest git, refresh root app, then sync:
 
 ```sh
-APP=operator-config-files-root
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main"}}}'
-
+./scripts/sync-application.sh operator-config-files-root
 oc get application openshift-workload-operators-descheduler-config -n openshift-gitops
 ```
 
@@ -704,14 +821,10 @@ Fix:
 oc patch installplan <installplan-name> -n openshift-kube-descheduler-operator \
   --type merge -p '{"spec":{"approved":true}}'
 
-# Wait for CSV Succeeded, then refresh and sync config
+# Wait for CSV Succeeded, then sync descheduler config
 watch oc get csv -n openshift-kube-descheduler-operator
-
-APP=openshift-workload-operators-config
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"operation":{"initiatedBy":{"username":"oc"},"sync":{"revision":"main","syncStrategy":{"apply":{"force":true}},"prune":true}}}'
+oc apply -f kube-descheduler-operator/config/kube-descheduler-cluster.yaml
+./scripts/sync-application.sh openshift-workload-operators-descheduler-config
 ```
 
 The config app retries automatically, but only succeeds once the descheduler

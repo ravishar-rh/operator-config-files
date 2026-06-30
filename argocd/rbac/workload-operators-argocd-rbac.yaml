@@ -1,0 +1,84 @@
+# Grant OpenShift GitOps application controller permission to manage
+# operator config CRs deployed by this repo.
+#
+# Apply once before syncing config Applications:
+#   oc apply -f argocd/rbac/workload-operators-argocd-rbac.yaml
+#
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openshift-gitops-workload-operators-config
+rules:
+  - apiGroups:
+      - self-node-remediation.medik8s.io
+    resources:
+      - selfnoderemediationtemplates
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - remediation.medik8s.io
+    resources:
+      - nodehealthchecks
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - fence-agents-remediation.medik8s.io
+    resources:
+      - fenceagentsremediationtemplates
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - machine-deletion-remediation.medik8s.io
+    resources:
+      - machinedeletionremediationtemplates
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+  - apiGroups:
+      - operator.openshift.io
+    resources:
+      - kubedeschedulers
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openshift-gitops-workload-operators-config
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: openshift-gitops-workload-operators-config
+subjects:
+  - kind: ServiceAccount
+    name: openshift-gitops-argocd-application-controller
+    namespace: openshift-gitops
