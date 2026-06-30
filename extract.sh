@@ -9,6 +9,8 @@ OUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKLOAD_NAMESPACE="openshift-workload-availability"
 BASE_DIR="${OUT_DIR}/base/${WORKLOAD_NAMESPACE}"
 CLUSTER_OVERLAY="${OUT_DIR}/clusters/ocp"
+CLUSTER_INSTALL="${CLUSTER_OVERLAY}/install"
+CLUSTER_CONFIG="${CLUSTER_OVERLAY}/config"
 
 DEFAULT_OPERATORS=(
   node-maintenance-operator
@@ -161,14 +163,15 @@ extract_chart() {
 
   if [[ "${chart_dir}" == "kube-descheduler-operator" ]]; then
     write_documents "${install_dir}" "${rendered}" false "${install_kinds}"
-    install_resources=()
-    while IFS= read -r file; do
-      install_resources+=("$(basename "${file}")")
-    done < <(find "${install_dir}" -maxdepth 1 -type f -name '*.yaml' | sort)
-    write_kustomization "${install_dir}" "${install_resources[@]}"
   else
     write_documents "${install_dir}" "${rendered}" false "Subscription"
   fi
+
+  install_resources=()
+  while IFS= read -r file; do
+    install_resources+=("$(basename "${file}")")
+  done < <(find "${install_dir}" -maxdepth 1 -type f -name '*.yaml' | sort)
+  write_kustomization "${install_dir}" "${install_resources[@]}"
 
   rendered_config="$(mktemp)"
   if ((${#extra_sets[@]} > 0)); then
@@ -220,27 +223,47 @@ write_shared_base() {
   rm -f "${rendered}"
 }
 
-write_cluster_overlay() {
+write_cluster_overlays() {
   local operators=("$@")
-  local resources=("../../base/${WORKLOAD_NAMESPACE}")
+  local install_resources=("../../../base/${WORKLOAD_NAMESPACE}")
+  local config_resources=()
 
   for operator in "${operators[@]}"; do
-    resources+=("../../${operator}")
+    install_resources+=("../../../${operator}/install")
+    if [[ -d "${OUT_DIR}/${operator}/config" ]]; then
+      config_resources+=("../../../${operator}/config")
+    fi
   done
 
-  mkdir -p "${CLUSTER_OVERLAY}"
-  write_kustomization "${CLUSTER_OVERLAY}" "${resources[@]}"
+  mkdir -p "${CLUSTER_INSTALL}" "${CLUSTER_CONFIG}"
+  write_kustomization "${CLUSTER_INSTALL}" "${install_resources[@]}"
+  write_kustomization "${CLUSTER_CONFIG}" "${config_resources[@]}"
+
+  cat > "${CLUSTER_OVERLAY}/kustomization.yaml" <<'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - install
+  - config
+EOF
+}
+
+patch_config_sync_waves() {
+  local nhc="${OUT_DIR}/node-health-check-operator/config/node-health-check-nhc-all-linux-nodes.yaml"
+  if [[ -f "${nhc}" ]]; then
+    sed -i '' 's/argocd.argoproj.io\/sync-wave: "6"/argocd.argoproj.io\/sync-wave: "7"/' "${nhc}"
+  fi
 }
 
 write_argocd_applications() {
   local apps_dir="${OUT_DIR}/argocd/applications"
   mkdir -p "${apps_dir}"
 
-  cat > "${apps_dir}/openshift-workload-operators.yaml" <<'EOF'
+  cat > "${apps_dir}/openshift-workload-operators-install.yaml" <<'EOF'
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: openshift-workload-operators
+  name: openshift-workload-operators-install
   namespace: openshift-gitops
   annotations:
     argocd.argoproj.io/sync-wave: "0"
@@ -249,17 +272,19 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/ravishar-rh/operator-config-files.git
+    repoURL: git@github.com:ravishar-rh/operator-config-files.git
     targetRevision: main
-    path: clusters/ocp
+    path: clusters/ocp/install
   destination:
     server: https://kubernetes.default.svc
   syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
     syncOptions:
       - CreateNamespace=false
       - ServerSideApply=true
       - RespectIgnoreDifferences=true
-      - SkipDryRunOnMissingResource=true
     retry:
       limit: 5
       backoff:
@@ -279,11 +304,48 @@ spec:
         - .status
 EOF
 
+  cat > "${apps_dir}/openshift-workload-operators-config.yaml" <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: openshift-workload-operators-config
+  namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:ravishar-rh/operator-config-files.git
+    targetRevision: main
+    path: clusters/ocp/config
+  destination:
+    server: https://kubernetes.default.svc
+  dependsOn:
+    - name: openshift-workload-operators-install
+  syncPolicy:
+    automated:
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m
+EOF
+
   cat > "${apps_dir}/kustomization.yaml" <<'EOF'
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
-  - openshift-workload-operators.yaml
+  - openshift-workload-operators-install.yaml
+  - openshift-workload-operators-config.yaml
 EOF
 
   cat > "${apps_dir}/root.yaml" <<'EOF'
@@ -297,7 +359,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/ravishar-rh/operator-config-files.git
+    repoURL: git@github.com:ravishar-rh/operator-config-files.git
     targetRevision: main
     path: argocd/applications
   destination:
@@ -326,13 +388,19 @@ extract_chart node-health-check-operator node-health-check \
 extract_chart kube-descheduler-operator kube-descheduler \
   --set deschedulerConfig.enabled=true
 
-write_cluster_overlay "${DEFAULT_OPERATORS[@]}"
+write_cluster_overlays "${DEFAULT_OPERATORS[@]}"
+patch_config_sync_waves
 write_argocd_applications
 
 if command -v kubectl >/dev/null 2>&1; then
-  echo "validating clusters/ocp kustomize build"
-  if ! kubectl kustomize "${CLUSTER_OVERLAY}" | grep -q '^kind:'; then
-    echo "kustomize build for clusters/ocp produced no resources" >&2
+  echo "validating clusters/ocp/install kustomize build"
+  if ! kubectl kustomize "${CLUSTER_INSTALL}" | grep -q '^kind:'; then
+    echo "kustomize build for clusters/ocp/install produced no resources" >&2
+    exit 1
+  fi
+  echo "validating clusters/ocp/config kustomize build"
+  if ! kubectl kustomize "${CLUSTER_CONFIG}" | grep -q '^kind:'; then
+    echo "kustomize build for clusters/ocp/config produced no resources" >&2
     exit 1
   fi
   echo "validating argocd/applications kustomize build"

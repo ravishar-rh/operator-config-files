@@ -4,7 +4,7 @@ metadata:
   name: nhc-all-linux-nodes
   namespace: openshift-workload-availability
   annotations:
-    argocd.argoproj.io/sync-wave: "6"
+    argocd.argoproj.io/sync-wave: "7"
     argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
 spec:
   minHealthy: "51%"

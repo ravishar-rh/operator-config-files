@@ -1,8 +1,10 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: operator-config-files-root
+  name: openshift-workload-operators-config
   namespace: openshift-gitops
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -10,13 +12,22 @@ spec:
   source:
     repoURL: git@github.com:ravishar-rh/operator-config-files.git
     targetRevision: main
-    path: argocd/applications
+    path: clusters/ocp/config
   destination:
     server: https://kubernetes.default.svc
-    namespace: openshift-gitops
+  dependsOn:
+    - name: openshift-workload-operators-install
   syncPolicy:
     automated:
-      prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=false
+      - ServerSideApply=true
+      - RespectIgnoreDifferences=true
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: -1
+      backoff:
+        duration: 1m
+        factor: 2
+        maxDuration: 10m
