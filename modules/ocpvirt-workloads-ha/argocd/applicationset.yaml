@@ -113,7 +113,7 @@ spec:
       finalizers:
         - resources-finalizer.argocd.argoproj.io
     spec:
-      project: default
+      project: ocpvirt-workloads-ha
       source:
         repoURL: git@github.com:ravishar-rh/operator-config-files.git
         targetRevision: main

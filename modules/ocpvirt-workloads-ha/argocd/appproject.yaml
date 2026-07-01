@@ -1,0 +1,48 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: ocpvirt-workloads-ha
+  namespace: openshift-gitops
+  labels:
+    app.kubernetes.io/part-of: ocpvirt-workloads-ha
+spec:
+  description: >
+    OpenShift Virtualization workload HA operators (node maintenance, remediation,
+    node health check, kube descheduler). Managed from operator-config-files git.
+  sourceRepos:
+    - git@github.com:ravishar-rh/operator-config-files.git
+    - https://github.com/ravishar-rh/operator-config-files.git
+  destinations:
+    # Namespaced config CRs
+    - server: https://kubernetes.default.svc
+      namespace: openshift-workload-availability
+    - server: https://kubernetes.default.svc
+      namespace: openshift-kube-descheduler-operator
+    # Cluster-scoped resources (Namespace, KubeDescheduler) and install apps with
+    # no destination.namespace (rbac, install overlay).
+    - server: https://kubernetes.default.svc
+      namespace: '*'
+  clusterResourceWhitelist:
+    - group: ''
+      kind: Namespace
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: operator.openshift.io
+      kind: KubeDescheduler
+  namespaceResourceWhitelist:
+    - group: operators.coreos.com
+      kind: Subscription
+    - group: operators.coreos.com
+      kind: OperatorGroup
+    - group: self-node-remediation.medik8s.io
+      kind: SelfNodeRemediationTemplate
+    - group: remediation.medik8s.io
+      kind: NodeHealthCheck
+    - group: fence-agents-remediation.medik8s.io
+      kind: FenceAgentsRemediationTemplate
+    - group: machine-deletion-remediation.medik8s.io
+      kind: MachineDeletionRemediationTemplate
+    - group: ''
+      kind: Secret

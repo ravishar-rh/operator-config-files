@@ -63,8 +63,10 @@ The workload OperatorGroup uses `spec: {}` (AllNamespaces mode) — do not set
 
 ### Argo CD ApplicationSet
 
-A single **ApplicationSet** generates four child Applications. This replaces the
-app-of-apps (`root`) pattern with one bootstrap resource.
+A single **ApplicationSet** in project **`ocpvirt-workloads-ha`** generates four
+child Applications. This replaces the app-of-apps (`root`) pattern with one
+bootstrap resource. The AppProject restricts source repos, destinations, and
+resource types to what this module needs.
 
 | Generated Application | Path | Purpose |
 |----------------------|------|---------|
@@ -164,7 +166,7 @@ After one-time bootstrap, commit and push to apply:
 | Config CRs (NHC, SNR template, KubeDescheduler) | `ocpvirt-workloads-ha-config`, `ocpvirt-workloads-ha-descheduler-config` |
 | Subscriptions, namespaces, OperatorGroups | `ocpvirt-workloads-ha-install` |
 | Argo CD RBAC | `ocpvirt-workloads-ha-rbac` |
-| Application CR / ApplicationSet fixes | `modules/ocpvirt-workloads-ha/argocd/applicationset.yaml` |
+| Application CR / ApplicationSet / AppProject fixes | `modules/ocpvirt-workloads-ha/argocd/` |
 
 All child apps use automated sync and selfHeal. Fix YAML, `git push`, Argo converges.
 
@@ -208,15 +210,19 @@ git push
 
 ```sh
 # 1. Register git repo in Argo CD (see Deployment guide)
-# 2. Bootstrap the ApplicationSet (creates all child Applications)
+# 2. Bootstrap AppProject, then ApplicationSet
+oc apply -k modules/ocpvirt-workloads-ha/argocd
 oc apply -f modules/ocpvirt-workloads-ha/argocd/applicationset.yaml
 ```
+
+AppProject must exist before the ApplicationSet (project `ocpvirt-workloads-ha`).
 
 If upgrading from the old app-of-apps layout, delete `ocpvirt-workloads-ha-root`
 first (see [Step 2](#step-2--remove-legacy-applications-if-upgrading)).
 
-After bootstrap, manifest and config changes are **git push only**. Edit
-`applicationset.yaml` to change Application paths, sync policy, or waves.
+After bootstrap, manifest and config changes are **git push only**. Edit files
+under `modules/ocpvirt-workloads-ha/argocd/` to change AppProject rules,
+Application paths, sync policy, or waves.
 
 ## Deployment guide
 
@@ -292,16 +298,19 @@ for app in ocpvirt-workloads-ha-root openshift-workload-operators openshift-work
   oc delete application "${app}" -n openshift-gitops --ignore-not-found
 done
 oc delete applicationset ocpvirt-workloads-ha -n openshift-gitops --ignore-not-found
+oc delete appproject ocpvirt-workloads-ha -n openshift-gitops --ignore-not-found
 ```
 
 ### Step 3 — Bootstrap (one time)
 
 ```sh
+oc apply -k modules/ocpvirt-workloads-ha/argocd
 oc apply -f modules/ocpvirt-workloads-ha/argocd/applicationset.yaml
-oc get applicationset,application -n openshift-gitops | grep ocpvirt
+oc get appproject,applicationset,application -n openshift-gitops | grep ocpvirt
 ```
 
-This creates one ApplicationSet and four child Applications with automated sync.
+This creates the AppProject, ApplicationSet, and four child Applications with
+automated sync.
 
 ### Step 4 — Push and let Argo CD sync manifests
 
@@ -407,6 +416,7 @@ oc delete operatorgroup --all -n openshift-kube-descheduler-operator --ignore-no
 
 # B — Delete ApplicationSet (stops recreation of child apps)
 oc delete applicationset ocpvirt-workloads-ha -n openshift-gitops --ignore-not-found
+oc delete appproject ocpvirt-workloads-ha -n openshift-gitops --ignore-not-found
 
 # C & D — Delete apps and clear finalizers
 for app in ocpvirt-workloads-ha-config ocpvirt-workloads-ha-descheduler-config \
