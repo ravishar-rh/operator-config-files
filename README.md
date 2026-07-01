@@ -26,7 +26,7 @@ Repository: https://github.com/ravishar-rh/operator-config-files
 │   ├── components/                   # Per-operator install/config bases
 │   ├── overlays/                     # install, config, config-descheduler, all
 │   └── argocd/                       # Argo CD Applications + RBAC
-└── scripts/                          # oc-only sync helpers
+└── scripts/                          # oc-only sync and InstallPlan helpers
 ```
 
 Module-level layout, kustomize builds, and bootstrap commands:
@@ -141,18 +141,70 @@ compatible.
 Approve **one at a time**. Wait for each CSV to reach **Succeeded** before the
 next. Do not approve all InstallPlans at once.
 
-| Order | Operator | Namespace |
-|-------|----------|-----------|
-| 1 | `node-maintenance-operator` | `openshift-workload-availability` |
-| 2 | `self-node-remediation` | `openshift-workload-availability` |
-| 3 | `node-healthcheck-operator` | `openshift-workload-availability` |
-| 4 | `cluster-kube-descheduler-operator` | `openshift-kube-descheduler-operator` |
+| Order | Subscription | Namespace | CSV match |
+|-------|--------------|-----------|-----------|
+| 1 | `node-maintenance-operator` | `openshift-workload-availability` | `node-maintenance` |
+| 2 | `self-node-remediation` | `openshift-workload-availability` | `self-node-remediation` |
+| 3 | `node-healthcheck-operator` | `openshift-workload-availability` | `node-healthcheck` |
+| 4 | `cluster-kube-descheduler-operator` | `openshift-kube-descheduler-operator` | `descheduler` |
+
+Helper script (recommended) — resolves InstallPlan name from the Subscription,
+approves it, and waits for CSV **Succeeded**:
 
 ```sh
-oc get installplan -n openshift-workload-availability   # or openshift-kube-descheduler-operator
-oc patch installplan <name> -n <namespace> --type merge -p '{"spec":{"approved":true}}'
-watch oc get csv -n <namespace>
+./scripts/approve-installplan.sh        # all four in order
+./scripts/approve-installplan.sh 2      # only step 2 (self-node-remediation)
 ```
+
+Manual equivalent — paste once, then run each line in order:
+
+```sh
+approve_operator() {
+  local namespace="$1"
+  local subscription="$2"
+  local csv_match="${3:-$subscription}"
+  local installplan=""
+
+  installplan="$(oc get subscription "${subscription}" -n "${namespace}" \
+    -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || true)"
+
+  if [[ -z "${installplan}" ]]; then
+    installplan="$(oc get installplan -n "${namespace}" -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{"\t"}{.spec.clusterServiceVersionNames}{"\n"}{end}' \
+      | grep -i "${csv_match}" | head -1 | cut -f1)"
+  fi
+
+  if [[ -z "${installplan}" ]]; then
+    echo "No pending InstallPlan for ${subscription} in ${namespace}" >&2
+    return 1
+  fi
+
+  if [[ "$(oc get installplan "${installplan}" -n "${namespace}" -o jsonpath='{.spec.approved}')" != "true" ]]; then
+    echo "Approving ${installplan} in ${namespace}..."
+    oc patch installplan "${installplan}" -n "${namespace}" --type merge \
+      -p '{"spec":{"approved":true}}'
+  fi
+
+  echo "Waiting for CSV matching ${csv_match} in ${namespace}..."
+  for _ in $(seq 1 60); do
+    if oc get csv -n "${namespace}" --no-headers 2>/dev/null \
+      | grep -i "${csv_match}" | awk '{print $NF}' | grep -qx Succeeded; then
+      oc get csv -n "${namespace}" | grep -i "${csv_match}"
+      return 0
+    fi
+    sleep 10
+  done
+  echo "Timed out waiting for CSV" >&2
+  return 1
+}
+
+approve_operator openshift-workload-availability node-maintenance-operator node-maintenance
+approve_operator openshift-workload-availability self-node-remediation self-node-remediation
+approve_operator openshift-workload-availability node-healthcheck-operator node-healthcheck
+approve_operator openshift-kube-descheduler-operator cluster-kube-descheduler-operator descheduler
+```
+
+Discovery uses `subscription.status.installPlanRef.name` first, then falls back to
+the oldest pending InstallPlan in that namespace whose CSV name matches.
 
 ### Deployment flow
 
@@ -274,9 +326,10 @@ oc get installplan -n openshift-kube-descheduler-operator
 
 ### Step 5 — Approve InstallPlans
 
-Follow the [InstallPlan approval order](#installplan-approval-order). Step 2
-(self-node-remediation) must succeed before step 3 — `NodeHealthCheck` references
-the `SelfNodeRemediationTemplate`.
+Run [InstallPlan approval](#installplan-approval-order) (script or manual
+`approve_operator` calls). Step 2 (self-node-remediation) must reach CSV
+**Succeeded** before step 3 — `NodeHealthCheck` references the
+`SelfNodeRemediationTemplate`.
 
 ### Step 6 — Verify CRDs
 
