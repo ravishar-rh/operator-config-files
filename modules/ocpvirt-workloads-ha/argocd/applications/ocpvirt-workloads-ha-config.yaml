@@ -4,7 +4,7 @@ metadata:
   name: ocpvirt-workloads-ha-config
   namespace: openshift-gitops
   annotations:
-    argocd.argoproj.io/sync-wave: "1"
+    argocd.argoproj.io/sync-wave: "2"
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -17,9 +17,11 @@ spec:
     server: https://kubernetes.default.svc
     namespace: openshift-workload-availability
   dependsOn:
+    - name: ocpvirt-workloads-ha-rbac
     - name: ocpvirt-workloads-ha-install
   syncPolicy:
     automated:
+      prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=false
@@ -29,6 +31,15 @@ spec:
     retry:
       limit: -1
       backoff:
-        duration: 1m
+        duration: 30s
         factor: 2
-        maxDuration: 10m
+        maxDuration: 5m
+  ignoreDifferences:
+    - group: self-node-remediation.medik8s.io
+      kind: SelfNodeRemediationTemplate
+      jqPathExpressions:
+        - .status
+    - group: remediation.medik8s.io
+      kind: NodeHealthCheck
+      jqPathExpressions:
+        - .status

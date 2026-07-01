@@ -4,7 +4,7 @@ metadata:
   name: cluster-kube-descheduler-operator
   namespace: openshift-kube-descheduler-operator
   annotations:
-    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-wave: "5"
 spec:
   channel: stable
   installPlanApproval: Manual

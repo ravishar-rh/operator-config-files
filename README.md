@@ -1,8 +1,10 @@
 # operator-config-files
 
 GitOps-ready OpenShift Virtualization workload HA operators, packaged as the
-**ocpvirt-workloads-ha** Kustomize module. Argo CD deploys operator install and
-config in two phases using OLM Classic (`Subscription` / `OperatorGroup`).
+**ocpvirt-workloads-ha** Kustomize module. Manifest fixes (config CRs, RBAC,
+subscriptions, Application specs) are delivered via **git push** — Argo CD applies
+them automatically. InstallPlan approval stays **Manual** (the one cluster
+operation OLM cannot do from git).
 
 Repository: https://github.com/ravishar-rh/operator-config-files
 
@@ -44,6 +46,10 @@ Module-level layout, kustomize builds, and bootstrap commands:
 | `openshift-kube-descheduler-operator` | `cluster-kube-descheduler-operator` |
 
 Also creates shared `Namespace` and `OperatorGroup` resources (sync-waves 0 and 1).
+Subscriptions use `installPlanApproval: Manual` with staggered sync-waves (2–5).
+Argo CD creates the Subscription objects from git; you approve each InstallPlan
+on the cluster (see [InstallPlan approval](#installplan-approval)).
+
 The workload OperatorGroup uses `spec: {}` (AllNamespaces mode) — do not set
 `targetNamespaces` to the same namespace or operator installs will fail.
 
@@ -59,30 +65,31 @@ The workload OperatorGroup uses `spec: {}` (AllNamespaces mode) — do not set
 
 | Application | Path | Purpose |
 |-------------|------|---------|
-| `ocpvirt-workloads-ha-root` | `modules/ocpvirt-workloads-ha/argocd/applications` | App-of-Apps parent |
-| `ocpvirt-workloads-ha-install` | `overlays/install` | OLM subscriptions |
+| `ocpvirt-workloads-ha-root` | `argocd/applications` | App-of-Apps parent |
+| `ocpvirt-workloads-ha-rbac` | `argocd/rbac` | Argo CD controller RBAC |
+| `ocpvirt-workloads-ha-install` | `overlays/install` | OLM subscriptions (Manual InstallPlan) |
 | `ocpvirt-workloads-ha-config` | `overlays/config` | Namespaced config CRs |
-| `ocpvirt-workloads-ha-descheduler-config` | `overlays/config-descheduler` | Cluster-scoped KubeDescheduler |
+| `ocpvirt-workloads-ha-descheduler-config` | `overlays/config-descheduler` | Cluster-scoped KubeDescheduler (no `destination.namespace`) |
 
 Paths are relative to `modules/ocpvirt-workloads-ha/`.
 
 ### Why multiple Argo CD Applications?
 
-**Install vs config** — OLM subscriptions only create InstallPlans. Operator CRDs
-such as `NodeHealthCheck` are registered only after you approve InstallPlans and
-the CSV install completes. If config CRs sync in the same Application, Argo CD
-reports:
-
-```
-Resource not found in cluster: remediation.medik8s.io/v1alpha1/NodeHealthCheck:nhc-all-linux-nodes
-```
-
-Phase 1 applies subscriptions. Phase 2 applies config CRs after phase 1 syncs,
-with unlimited retry until CRDs exist.
+**Install vs config** — OLM subscriptions create InstallPlans and install CSVs
+asynchronously. Operator CRDs are registered only after each CSV completes. If
+config CRs sync in the same Application before CRDs exist, Argo CD reports
+`Resource not found in cluster`. Config apps use `SkipDryRunOnMissingResource`,
+unlimited retry, and `dependsOn` the install app so they converge automatically
+once operators are ready.
 
 **Config vs descheduler-config** — `KubeDescheduler` is cluster-scoped (no
-namespace). Argo CD cannot deploy it in the same Application as namespaced CRs
-without `InvalidSpecError: Namespace ... is missing`.
+namespace). It must be deployed by `ocpvirt-workloads-ha-descheduler-config`
+which has **no** `destination.namespace`. Deploying it via the config app (which
+sets `destination.namespace`) causes:
+
+```
+Namespace for cluster operator.openshift.io/v1, Kind=KubeDescheduler is missing.
+```
 
 ### OLM Classic vs OLM v1
 
@@ -126,7 +133,7 @@ of the following:
 |--------|----------------------|
 | **Red Hat NOV path** | NOV GitOps and Workload Availability docs target `Subscription` + `redhat-operators` |
 | **Package compatibility** | Workload HA operators may not meet OLM v1 requirements (webhooks, install modes) |
-| **GitOps work already done** | Install/config split, sync-waves, InstallPlan approval, and Argo CD RBAC are solved |
+| **GitOps work already done** | Install/config split, Manual InstallPlans, sync-waves, retry, RBAC and config via git push |
 | **Runtime behavior** | Operator CRs behave the same regardless of which OLM generation installed them |
 | **Support lifecycle** | Red Hat commits to Classic OLM support throughout OpenShift 4 |
 
@@ -136,95 +143,65 @@ compatible.
 
 ## Quick reference
 
-### InstallPlan approval order
+### What git push handles (no `oc apply` needed)
 
-Approve **one at a time**. Wait for each CSV to reach **Succeeded** before the
-next. Do not approve all InstallPlans at once.
+After one-time bootstrap, commit and push to apply:
 
-| Order | Subscription | Namespace | CSV match |
-|-------|--------------|-----------|-----------|
-| 1 | `node-maintenance-operator` | `openshift-workload-availability` | `node-maintenance` |
-| 2 | `self-node-remediation` | `openshift-workload-availability` | `self-node-remediation` |
-| 3 | `node-healthcheck-operator` | `openshift-workload-availability` | `node-healthcheck` |
-| 4 | `cluster-kube-descheduler-operator` | `openshift-kube-descheduler-operator` | `descheduler` |
+| Change in git | Argo CD Application |
+|---------------|---------------------|
+| Config CRs (NHC, SNR template, KubeDescheduler) | `ocpvirt-workloads-ha-config`, `ocpvirt-workloads-ha-descheduler-config` |
+| Subscriptions, namespaces, OperatorGroups | `ocpvirt-workloads-ha-install` |
+| Argo CD RBAC | `ocpvirt-workloads-ha-rbac` |
+| Application CR fixes (paths, sync policy) | `ocpvirt-workloads-ha-root` → child apps |
 
-Helper script (recommended) — resolves InstallPlan name from the Subscription,
-approves it, and waits for CSV **Succeeded**:
+All child apps use automated sync and selfHeal. Fix YAML, `git push`, Argo converges.
+
+### What still requires cluster action
+
+| Action | Why | How |
+|--------|-----|-----|
+| **InstallPlan approval** | OLM Manual mode — not controllable from git | `./scripts/approve-installplan.sh` |
+| **One-time bootstrap** | Argo CD needs initial app-of-apps + repo secret | See [Deployment guide](#deployment-guide) |
+
+### InstallPlan approval
+
+Approve **one at a time**. Wait for each CSV to reach **Succeeded** before the next.
+
+| Order | Subscription | Namespace |
+|-------|--------------|-----------|
+| 1 | `node-maintenance-operator` | `openshift-workload-availability` |
+| 2 | `self-node-remediation` | `openshift-workload-availability` |
+| 3 | `node-healthcheck-operator` | `openshift-workload-availability` |
+| 4 | `cluster-kube-descheduler-operator` | `openshift-kube-descheduler-operator` |
 
 ```sh
 ./scripts/approve-installplan.sh        # all four in order
-./scripts/approve-installplan.sh 2      # only step 2 (self-node-remediation)
+./scripts/approve-installplan.sh 2      # only step 2
 ```
 
-Manual equivalent — paste once, then run each line in order:
-
-```sh
-approve_operator() {
-  local namespace="$1"
-  local subscription="$2"
-  local csv_match="${3:-$subscription}"
-  local installplan=""
-
-  installplan="$(oc get subscription "${subscription}" -n "${namespace}" \
-    -o jsonpath='{.status.installPlanRef.name}' 2>/dev/null || true)"
-
-  if [[ -z "${installplan}" ]]; then
-    installplan="$(oc get installplan -n "${namespace}" -o jsonpath='{range .items[?(@.spec.approved==false)]}{.metadata.name}{"\t"}{.spec.clusterServiceVersionNames}{"\n"}{end}' \
-      | grep -i "${csv_match}" | head -1 | cut -f1)"
-  fi
-
-  if [[ -z "${installplan}" ]]; then
-    echo "No pending InstallPlan for ${subscription} in ${namespace}" >&2
-    return 1
-  fi
-
-  if [[ "$(oc get installplan "${installplan}" -n "${namespace}" -o jsonpath='{.spec.approved}')" != "true" ]]; then
-    echo "Approving ${installplan} in ${namespace}..."
-    oc patch installplan "${installplan}" -n "${namespace}" --type merge \
-      -p '{"spec":{"approved":true}}'
-  fi
-
-  echo "Waiting for CSV matching ${csv_match} in ${namespace}..."
-  for _ in $(seq 1 60); do
-    if oc get csv -n "${namespace}" --no-headers 2>/dev/null \
-      | grep -i "${csv_match}" | awk '{print $NF}' | grep -qx Succeeded; then
-      oc get csv -n "${namespace}" | grep -i "${csv_match}"
-      return 0
-    fi
-    sleep 10
-  done
-  echo "Timed out waiting for CSV" >&2
-  return 1
-}
-
-approve_operator openshift-workload-availability node-maintenance-operator node-maintenance
-approve_operator openshift-workload-availability self-node-remediation self-node-remediation
-approve_operator openshift-workload-availability node-healthcheck-operator node-healthcheck
-approve_operator openshift-kube-descheduler-operator cluster-kube-descheduler-operator descheduler
-```
-
-Discovery uses `subscription.status.installPlanRef.name` first, then falls back to
-the oldest pending InstallPlan in that namespace whose CSV name matches.
+The script resolves InstallPlan name and namespace from each Subscription
+automatically.
 
 ### Deployment flow
 
 ```
-Apply root.yaml
-  → Install app syncs subscriptions
-    → Approve operators in order (see table above)
-  → All CRDs Established
-    → Config apps sync:
-        SelfNodeRemediationTemplate (wave 6)
-        NodeHealthCheck (wave 7)
-        KubeDescheduler (wave 8)
+git push
+  → Argo CD syncs Applications, RBAC, subscriptions (Manual InstallPlans created)
+    → You approve InstallPlans in order (cluster operation)
+  → CSVs install, CRDs registered
+    → Config apps retry until CRDs exist, then apply config CRs automatically
 ```
 
-### One-time cluster setup
+### One-time cluster bootstrap
 
 ```sh
-oc apply -f modules/ocpvirt-workloads-ha/argocd/rbac/ocpvirt-workloads-ha-argocd-rbac.yaml
+# 1. Register git repo in Argo CD (see Deployment guide)
+# 2. Bootstrap the app-of-apps
 oc apply -f modules/ocpvirt-workloads-ha/argocd/applications/root.yaml
 ```
+
+After bootstrap, manifest and config changes are **git push only**. RBAC is
+synced by the `ocpvirt-workloads-ha-rbac` Application — no separate `oc apply`.
 
 ## Deployment guide
 
@@ -233,25 +210,18 @@ If a previous attempt failed, start with
 
 ### Prerequisites
 
+OpenShift GitOps (Argo CD) must be installed and you must be logged in:
+
 ```sh
 oc whoami
 oc get ns openshift-gitops
 oc get pods -n openshift-gitops
 ```
 
-Grant the Argo CD application controller permission to create operator config
-CRs (required once per cluster):
-
-```sh
-oc apply -f modules/ocpvirt-workloads-ha/argocd/rbac/ocpvirt-workloads-ha-argocd-rbac.yaml
-
-oc auth can-i patch selfnoderemediationtemplates \
-  --as=system:serviceaccount:openshift-gitops:openshift-gitops-argocd-application-controller \
-  -n openshift-workload-availability
-# Expected: yes
-```
-
-All steps below use `oc` only — no local `argocd` CLI required.
+**Git push** applies all manifest changes (config CRs, RBAC, subscriptions,
+Application specs) via Argo CD automated sync — no `oc apply -k` for module
+content. The only recurring cluster operation is **InstallPlan approval** (OLM
+Manual mode).
 
 ### Step 1 — Push repo and register in Argo CD
 
@@ -307,62 +277,57 @@ for app in openshift-workload-operators openshift-workload-operators-install \
 done
 ```
 
-### Step 3 — Bootstrap
+### Step 3 — Bootstrap (one time)
 
 ```sh
 oc apply -f modules/ocpvirt-workloads-ha/argocd/applications/root.yaml
 oc get applications -n openshift-gitops
 ```
 
-### Step 4 — Confirm Phase 1 sync
+This creates five child Applications: `rbac`, `install`, `config`,
+`descheduler-config`, all with automated sync.
+
+### Step 4 — Push and let Argo CD sync manifests
 
 ```sh
-oc get application ocpvirt-workloads-ha-install -n openshift-gitops
-oc get subscription -n openshift-workload-availability
-oc get subscription -n openshift-kube-descheduler-operator
-oc get installplan -n openshift-workload-availability
-oc get installplan -n openshift-kube-descheduler-operator
+git push origin main
 ```
 
-### Step 5 — Approve InstallPlans
+Argo CD applies subscriptions, RBAC, and config CRs from git. Subscriptions
+create **pending** InstallPlans (Manual mode).
 
-Run [InstallPlan approval](#installplan-approval-order) (script or manual
-`approve_operator` calls). Step 2 (self-node-remediation) must reach CSV
-**Succeeded** before step 3 — `NodeHealthCheck` references the
-`SelfNodeRemediationTemplate`.
+### Step 5 — Approve InstallPlans (cluster operation)
 
-### Step 6 — Verify CRDs
+This is the one step OLM cannot do from git:
 
 ```sh
-oc get crd selfnoderemediationtemplates.self-node-remediation.medik8s.io
-oc get crd nodehealthchecks.remediation.medik8s.io
-oc get crd kubedeschedulers.operator.openshift.io
+./scripts/approve-installplan.sh
 ```
 
-All should exist and be **Established**.
+Approve one at a time; the script waits for each CSV **Succeeded** before the
+next. Step 2 (self-node-remediation) must complete before step 3.
 
-### Step 7 — Confirm Phase 2 sync
+Config apps retry until CRDs exist — **Missing** on config resources until
+InstallPlans are approved is normal.
 
-```sh
-oc get application ocpvirt-workloads-ha-config -n openshift-gitops
-oc get application ocpvirt-workloads-ha-descheduler-config -n openshift-gitops
-```
-
-If still failing after all CSVs are Succeeded:
+### Step 6 — Verify (optional)
 
 ```sh
-./scripts/apply-workload-config.sh
-./scripts/sync-application.sh ocpvirt-workloads-ha-config
-./scripts/sync-application.sh ocpvirt-workloads-ha-descheduler-config
-```
-
-Verify:
-
-```sh
-oc get selfnoderemediationtemplate -n openshift-workload-availability
-oc get nodehealthcheck -n openshift-workload-availability
+oc get csv -n openshift-workload-availability
+oc get csv -n openshift-kube-descheduler-operator
+oc get selfnoderemediationtemplate,nodehealthcheck -n openshift-workload-availability
 oc get kubedescheduler cluster
+oc get applications -n openshift-gitops
 ```
+
+### Ongoing changes
+
+Edit YAML under `modules/ocpvirt-workloads-ha/`, commit, and `git push`. Argo CD
+syncs automatically — no `oc apply` of module manifests.
+
+New operator installs still need InstallPlan approval after push. Config-only
+changes (NHC selectors, KubeDescheduler thresholds, remediation backend) apply
+from git once operators and CRDs are in place.
 
 ## Recovery and cleanup
 
@@ -402,7 +367,7 @@ oc apply -f modules/ocpvirt-workloads-ha/components/base-openshift-workload-avai
 ./scripts/sync-application.sh ocpvirt-workloads-ha-install
 ```
 
-Continue from [Step 5 — Approve InstallPlans](#step-5--approve-installplans).
+Continue from [Step 5 — Approve InstallPlans](#step-5--approve-installplans-cluster-operation).
 
 ### Level 2 — Full reset (including Argo CD apps)
 
@@ -430,7 +395,8 @@ oc patch application ocpvirt-workloads-ha-root -n openshift-gitops --type=json \
 
 # C & D — Delete apps and clear finalizers
 for app in ocpvirt-workloads-ha-config ocpvirt-workloads-ha-descheduler-config \
-           ocpvirt-workloads-ha-install ocpvirt-workloads-ha-root \
+           ocpvirt-workloads-ha-install ocpvirt-workloads-ha-rbac \
+           ocpvirt-workloads-ha-root \
            openshift-workload-operators-config openshift-workload-operators-descheduler-config \
            openshift-workload-operators-install openshift-workload-operators \
            operator-config-files-root; do
@@ -443,7 +409,7 @@ oc get application -n openshift-gitops | grep -E 'ocpvirt|workload|operator-conf
 ```
 
 Then follow [Step 1](#step-1--push-repo-and-register-in-argocd) through
-[Step 7](#step-7--confirm-phase-2-sync).
+[Step 5](#step-5--approve-installplans-cluster-operation).
 
 ### Level 3 — Delete namespaces (nuclear)
 
@@ -477,7 +443,16 @@ either (Level 2+). OperatorGroup `spec: {}` with no `targetNamespaces`.
 
 ## Day-to-day operations
 
-Use these instead of the `argocd` CLI.
+### Normal workflow: git push
+
+Edit manifests, commit, push. Argo CD automated sync and selfHeal apply changes.
+No `oc apply -k` required for module content.
+
+### InstallPlan approval (after push creates new subscriptions)
+
+```sh
+./scripts/approve-installplan.sh
+```
 
 ### Check Application status
 
@@ -488,42 +463,13 @@ oc get application ocpvirt-workloads-ha-install ocpvirt-workloads-ha-config \
   -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status
 ```
 
-### Sync an Application
+### Force sync (fallback only)
 
-Helper script (recommended):
+If selfHeal does not pick up a git change within a few minutes:
 
 ```sh
 ./scripts/sync-application.sh ocpvirt-workloads-ha-config
 FORCE=true ./scripts/sync-application.sh ocpvirt-workloads-ha-config
-```
-
-The `operation` field is **top-level** on the Application (not under `spec`).
-Use `syncStrategy.hook` or `syncStrategy.apply` — not `revision` alone.
-
-Manual equivalent:
-
-```sh
-APP=ocpvirt-workloads-ha-config
-oc patch application "${APP}" -n openshift-gitops --type json \
-  -p='[{"op":"remove","path":"/operation"}]' 2>/dev/null || true
-oc patch application "${APP}" -n openshift-gitops --type merge \
-  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
-oc patch application "${APP}" -n openshift-gitops --type merge -p '{
-  "operation": {
-    "initiatedBy": {"username": "oc"},
-    "sync": {"syncStrategy": {"hook": {}}}
-  }
-}'
-```
-
-### Apply config directly (bypass Argo CD)
-
-When operators and CRDs are healthy but Argo CD will not sync:
-
-```sh
-./scripts/apply-workload-config.sh
-# or
-oc apply -k modules/ocpvirt-workloads-ha/overlays/config
 ```
 
 ### Open Argo CD UI (optional)
@@ -538,12 +484,11 @@ oc get route openshift-gitops-server -n openshift-gitops \
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | OwnNamespace InstallModeType not supported | OperatorGroup `targetNamespaces` set to install namespace | Use `spec: {}` in git; [Level 1 reset](#level-1-reset-operators-keep-argocd) on cluster |
-| NodeHealthCheck / SNR template not found | Operator CRD not registered yet | [Approve InstallPlans in order](#installplan-approval-order); sync config app |
-| Argo CD forbidden on config CRs | Missing Argo CD RBAC | `oc apply -f modules/ocpvirt-workloads-ha/argocd/rbac/ocpvirt-workloads-ha-argocd-rbac.yaml` |
-| Config CRs Missing after CSVs Succeeded | Stuck sync or wrong patch format | [Apply config directly](#apply-config-directly-bypass-argocd) then sync |
-| KubeDescheduler namespace missing | Cluster-scoped CR mixed with namespaced CRs | Use separate `ocpvirt-workloads-ha-descheduler-config` app (already in git) |
+| NodeHealthCheck / SNR template not found | CRD not registered — InstallPlans not approved yet | [Approve InstallPlans](#installplan-approval); config app retries automatically |
+| KubeDescheduler not found | Descheduler CRD not registered yet | Approve step 4; descheduler-config app retries automatically |
+| KubeDescheduler namespace missing | Wrong Application syncing cluster-scoped CR | Ensure only `ocpvirt-workloads-ha-descheduler-config` deploys KubeDescheduler (no `destination.namespace`) |
 | KubeDescheduler validation error | `devLowNodeUtilizationThresholds` must be a string | Set to `Low`, `Medium`, or `High` in kube-descheduler-cluster.yaml |
-| KubeDescheduler CRD missing | Descheduler InstallPlan not approved | Approve step 4 in [approval order](#installplan-approval-order) |
+| Argo CD forbidden on config CRs | RBAC app not synced | Confirm `ocpvirt-workloads-ha-rbac` is Synced |
 | Application will not delete | Root app recreates children / finalizers | [Level 2 reset](#level-2-full-reset-including-argocd-apps) |
 | Argo CD cannot reach GitHub | Missing or wrong repo secret | Re-create secret per [Step 1](#step-1--push-repo-and-register-in-argocd) |
 
@@ -558,6 +503,49 @@ The node maintenance / remediation / health check operators require
 **AllNamespaces** mode. Fix:
 `modules/ocpvirt-workloads-ha/components/base-openshift-workload-availability/operatorgroup.yaml`
 must use `spec: {}`.
+
+### KubeDescheduler not found (detail)
+
+```
+Resource not found in cluster: operator.openshift.io/v1/KubeDescheduler:cluster
+```
+
+**Cause:** Descheduler operator CSV not installed yet — approve InstallPlan step 4.
+Config app retries automatically once the CRD exists.
+
+```sh
+./scripts/approve-installplan.sh 4
+```
+
+If CSV is **Succeeded** but Argo CD still shows Missing, hard-refresh the app
+(git push should also trigger selfHeal):
+
+```sh
+oc patch application ocpvirt-workloads-ha-descheduler-config -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
+```
+
+### KubeDescheduler namespace missing (detail)
+
+```
+Namespace for cluster operator.openshift.io/v1, Kind=KubeDescheduler is missing.
+```
+
+**Cause:** `KubeDescheduler` is being synced by an Application with
+`destination.namespace` set (usually `ocpvirt-workloads-ha-config` or a legacy
+app), instead of `ocpvirt-workloads-ha-descheduler-config`.
+
+**Fix:** Push latest git and confirm Application paths:
+
+```sh
+oc get application -n openshift-gitops \
+  -o custom-columns=NAME:.metadata.name,PATH:.spec.source.path,NS:.spec.destination.namespace \
+  | grep -E 'NAME|ocpvirt'
+```
+
+`ocpvirt-workloads-ha-descheduler-config` must use path
+`modules/ocpvirt-workloads-ha/overlays/config-descheduler` with **empty** DEST_NS.
+Delete legacy `openshift-workload-operators-*` apps if present.
 
 ### KubeDescheduler profileCustomizations validation (detail)
 
@@ -576,12 +564,16 @@ profileCustomizations:
 
 ### Config app stuck OutOfSync (detail)
 
+After InstallPlans are approved and CSVs are **Succeeded**, push your fix to git.
+Argo CD selfHeal should apply it. If stuck, hard-refresh:
+
 ```sh
-./scripts/apply-workload-config.sh
-./scripts/sync-application.sh ocpvirt-workloads-ha-config
-oc get application ocpvirt-workloads-ha-config -n openshift-gitops \
-  -o jsonpath='{.status.operationState.message}{"\n"}'
+oc patch application ocpvirt-workloads-ha-config -n openshift-gitops --type merge \
+  -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
 ```
+
+Scripts `./scripts/apply-workload-config.sh` and `./scripts/sync-application.sh`
+are optional fallbacks only — not needed for normal git-push workflow.
 
 ## Customization
 
@@ -624,7 +616,10 @@ Paths are relative to `modules/ocpvirt-workloads-ha/`.
 
 ## Notes
 
+- Subscriptions use `installPlanApproval: Manual` — approve InstallPlans on the cluster; everything else is git push.
+- Config apps use unlimited retry; **Missing** status until CRDs exist is normal.
 - Subscriptions ignore OLM-managed `status` and `startingCSV` drift in Argo CD.
 - Do not commit production secrets — use Sealed Secrets or External Secrets.
 - `machine-deletion-remediation-operator` only applies on Machine API clusters.
 - `kube-descheduler-operator` uses namespace `openshift-kube-descheduler-operator`.
+- `scripts/approve-installplan.sh` is for InstallPlan approval only; config/RBAC fixes do not need `oc apply`.

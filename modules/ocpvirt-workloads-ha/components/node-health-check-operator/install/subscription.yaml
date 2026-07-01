@@ -4,7 +4,7 @@ metadata:
   name: node-healthcheck-operator
   namespace: openshift-workload-availability
   annotations:
-    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-wave: "4"
 spec:
   channel: stable
   installPlanApproval: Manual

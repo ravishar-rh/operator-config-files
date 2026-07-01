@@ -4,7 +4,7 @@ metadata:
   name: ocpvirt-workloads-ha-descheduler-config
   namespace: openshift-gitops
   annotations:
-    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-wave: "3"
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -13,12 +13,15 @@ spec:
     repoURL: git@github.com:ravishar-rh/operator-config-files.git
     targetRevision: main
     path: modules/ocpvirt-workloads-ha/overlays/config-descheduler
+  # Cluster-scoped KubeDescheduler — do not set destination.namespace.
   destination:
     server: https://kubernetes.default.svc
   dependsOn:
+    - name: ocpvirt-workloads-ha-rbac
     - name: ocpvirt-workloads-ha-install
   syncPolicy:
     automated:
+      prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=false
@@ -28,6 +31,11 @@ spec:
     retry:
       limit: -1
       backoff:
-        duration: 1m
+        duration: 30s
         factor: 2
-        maxDuration: 10m
+        maxDuration: 5m
+  ignoreDifferences:
+    - group: operator.openshift.io
+      kind: KubeDescheduler
+      jqPathExpressions:
+        - .status

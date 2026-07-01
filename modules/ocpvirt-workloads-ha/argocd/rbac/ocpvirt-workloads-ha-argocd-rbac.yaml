@@ -1,6 +1,8 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
   name: ocpvirt-workloads-ha-argocd
 rules:
   - apiGroups:
@@ -67,6 +69,8 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
   name: ocpvirt-workloads-ha-argocd
 roleRef:
   apiGroup: rbac.authorization.k8s.io

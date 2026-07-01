@@ -8,16 +8,11 @@ kube descheduler.
 
 ```
 modules/ocpvirt-workloads-ha/
-├── kustomization.yaml              # module root → overlays/all
 ├── components/                     # per-operator install/config bases
-├── overlays/
-│   ├── install/                    # Phase 1: OLM subscriptions
-│   ├── config/                     # Phase 2: namespaced config CRs
-│   ├── config-descheduler/         # Phase 2: cluster-scoped KubeDescheduler
-│   └── all/                        # full stack (local validation)
+├── overlays/                       # install, config, config-descheduler, all
 └── argocd/
-    ├── applications/               # Argo CD Application CRs
-    └── rbac/                       # Argo CD controller RBAC
+    ├── applications/               # Argo CD Application CRs (app-of-apps)
+    └── rbac/                       # Argo CD controller RBAC (synced via git)
 ```
 
 ## Kustomize builds
@@ -28,16 +23,15 @@ Run from the repository root:
 kubectl kustomize modules/ocpvirt-workloads-ha/overlays/install
 kubectl kustomize modules/ocpvirt-workloads-ha/overlays/config
 kubectl kustomize modules/ocpvirt-workloads-ha/overlays/config-descheduler
-kubectl kustomize modules/ocpvirt-workloads-ha
 ```
 
-## Bootstrap
+## Bootstrap (one time per cluster)
 
 ```sh
-oc apply -f modules/ocpvirt-workloads-ha/argocd/rbac/ocpvirt-workloads-ha-argocd-rbac.yaml
 oc apply -f modules/ocpvirt-workloads-ha/argocd/applications/root.yaml
 ```
 
-Deployment, InstallPlan approval, recovery, troubleshooting, and OLM Classic
-vs OLM v1 guidance:
-[repository README](../../README.md)
+After bootstrap, manifest and config changes are delivered via `git push`.
+InstallPlan approval remains a cluster operation (`./scripts/approve-installplan.sh`).
+
+Full guide: [repository README](../../README.md)
