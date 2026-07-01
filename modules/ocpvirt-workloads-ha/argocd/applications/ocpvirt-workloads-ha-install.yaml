@@ -1,7 +1,7 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: openshift-workload-operators-install
+  name: ocpvirt-workloads-ha-install
   namespace: openshift-gitops
   annotations:
     argocd.argoproj.io/sync-wave: "0"
@@ -12,7 +12,7 @@ spec:
   source:
     repoURL: git@github.com:ravishar-rh/operator-config-files.git
     targetRevision: main
-    path: clusters/ocp/install
+    path: modules/ocpvirt-workloads-ha/overlays/install
   destination:
     server: https://kubernetes.default.svc
   syncPolicy:

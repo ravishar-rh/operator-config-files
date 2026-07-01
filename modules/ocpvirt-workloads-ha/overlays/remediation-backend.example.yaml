@@ -1,0 +1,10 @@
+# Example: swap self-node-remediation for fence-agents-remediation.
+#
+# 1. Edit overlays/config/kustomization.yaml
+# 2. Replace:
+#      - ../../components/self-node-remediation-operator/config
+#    with:
+#      - ../../components/fence-agents-remediation-operator/config
+# 3. Update fence-agents-remediation-operator/config/secret-*.yaml
+# 4. Update node-health-check-operator/config/node-health-check-*.yaml
+#    remediationTemplate to point at the FAR template if needed.

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Apply workload config CRs directly with oc (bypasses Argo CD sync issues).
+# Apply ocpvirt-workloads-ha workload config directly with oc.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_DIR="${REPO_DIR}/clusters/ocp/config"
+MODULE_DIR="${REPO_DIR}/modules/ocpvirt-workloads-ha"
+CONFIG_DIR="${MODULE_DIR}/overlays/config"
 
 echo "Checking operator CRDs..."
 for crd in \
@@ -24,8 +25,8 @@ oc get selfnoderemediationtemplate -n openshift-workload-availability
 oc get nodehealthcheck -n openshift-workload-availability
 
 echo "Refreshing Argo CD app so it matches cluster state..."
-if oc get application openshift-workload-operators-config -n openshift-gitops >/dev/null 2>&1; then
-  oc patch application openshift-workload-operators-config -n openshift-gitops --type merge \
+if oc get application ocpvirt-workloads-ha-config -n openshift-gitops >/dev/null 2>&1; then
+  oc patch application ocpvirt-workloads-ha-config -n openshift-gitops --type merge \
     -p '{"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}'
 fi
 

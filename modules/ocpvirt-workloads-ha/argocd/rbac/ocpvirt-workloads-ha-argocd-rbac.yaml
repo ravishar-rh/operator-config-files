@@ -1,13 +1,7 @@
-# Grant OpenShift GitOps application controller permission to manage
-# operator config CRs deployed by this repo.
-#
-# Apply once before syncing config Applications:
-#   oc apply -f argocd/rbac/workload-operators-argocd-rbac.yaml
-#
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: openshift-gitops-workload-operators-config
+  name: ocpvirt-workloads-ha-argocd
 rules:
   - apiGroups:
       - self-node-remediation.medik8s.io
@@ -73,11 +67,11 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: openshift-gitops-workload-operators-config
+  name: ocpvirt-workloads-ha-argocd
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: openshift-gitops-workload-operators-config
+  name: ocpvirt-workloads-ha-argocd
 subjects:
   - kind: ServiceAccount
     name: openshift-gitops-argocd-application-controller

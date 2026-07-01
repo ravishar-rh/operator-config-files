@@ -1,10 +1,8 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: openshift-workload-operators-descheduler-config
+  name: ocpvirt-workloads-ha-root
   namespace: openshift-gitops
-  annotations:
-    argocd.argoproj.io/sync-wave: "2"
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
@@ -12,22 +10,13 @@ spec:
   source:
     repoURL: git@github.com:ravishar-rh/operator-config-files.git
     targetRevision: main
-    path: clusters/ocp/config-descheduler
+    path: modules/ocpvirt-workloads-ha/argocd/applications
   destination:
     server: https://kubernetes.default.svc
-  dependsOn:
-    - name: openshift-workload-operators-install
+    namespace: openshift-gitops
   syncPolicy:
     automated:
+      prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=false
-      - ServerSideApply=true
-      - RespectIgnoreDifferences=true
-      - SkipDryRunOnMissingResource=true
-    retry:
-      limit: -1
-      backoff:
-        duration: 1m
-        factor: 2
-        maxDuration: 10m

@@ -8,7 +8,7 @@ FORCE="${FORCE:-false}"
 
 if [[ -z "${APP}" ]]; then
   echo "Usage: $0 <application-name> [namespace]" >&2
-  echo "Example: $0 openshift-workload-operators-config" >&2
+  echo "Example: $0 ocpvirt-workloads-ha-config" >&2
   exit 1
 fi
 
