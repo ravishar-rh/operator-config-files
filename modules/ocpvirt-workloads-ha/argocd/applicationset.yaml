@@ -12,7 +12,6 @@ spec:
           - name: rbac
             path: modules/ocpvirt-workloads-ha/argocd/rbac
             wave: "0"
-            namespace: ""
             templatePatch: |
               spec:
                 syncPolicy:
@@ -21,7 +20,6 @@ spec:
           - name: install
             path: modules/ocpvirt-workloads-ha/overlays/install
             wave: "1"
-            namespace: ""
             templatePatch: |
               spec:
                 syncPolicy:
@@ -49,9 +47,10 @@ spec:
           - name: config
             path: modules/ocpvirt-workloads-ha/overlays/config
             wave: "2"
-            namespace: openshift-workload-availability
             templatePatch: |
               spec:
+                destination:
+                  namespace: openshift-workload-availability
                 dependsOn:
                   - name: ocpvirt-workloads-ha-rbac
                   - name: ocpvirt-workloads-ha-install
@@ -79,7 +78,6 @@ spec:
           - name: descheduler-config
             path: modules/ocpvirt-workloads-ha/overlays/config-descheduler
             wave: "3"
-            namespace: ""
             templatePatch: |
               spec:
                 dependsOn:
@@ -120,9 +118,6 @@ spec:
         path: "{{.path}}"
       destination:
         server: https://kubernetes.default.svc
-        {{- if ne .namespace "" }}
-        namespace: {{.namespace}}
-        {{- end }}
       syncPolicy:
         automated:
           prune: true
