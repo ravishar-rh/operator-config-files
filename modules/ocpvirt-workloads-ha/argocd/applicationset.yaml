@@ -1,0 +1,131 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: ocpvirt-workloads-ha
+  namespace: openshift-gitops
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    - list:
+        elements:
+          - name: rbac
+            path: modules/ocpvirt-workloads-ha/argocd/rbac
+            wave: "0"
+            namespace: ""
+            templatePatch: |
+              spec:
+                syncPolicy:
+                  syncOptions:
+                    - ServerSideApply=true
+          - name: install
+            path: modules/ocpvirt-workloads-ha/overlays/install
+            wave: "1"
+            namespace: ""
+            templatePatch: |
+              spec:
+                syncPolicy:
+                  syncOptions:
+                    - CreateNamespace=false
+                    - ServerSideApply=true
+                    - RespectIgnoreDifferences=true
+                  retry:
+                    limit: 5
+                    backoff:
+                      duration: 30s
+                      factor: 2
+                      maxDuration: 5m
+                ignoreDifferences:
+                  - group: operators.coreos.com
+                    kind: Subscription
+                    jqPathExpressions:
+                      - .status
+                      - .spec.startingCSV
+                  - group: operators.coreos.com
+                    kind: InstallPlan
+                    jqPathExpressions:
+                      - .spec.approved
+                      - .status
+          - name: config
+            path: modules/ocpvirt-workloads-ha/overlays/config
+            wave: "2"
+            namespace: openshift-workload-availability
+            templatePatch: |
+              spec:
+                dependsOn:
+                  - name: ocpvirt-workloads-ha-rbac
+                  - name: ocpvirt-workloads-ha-install
+                syncPolicy:
+                  syncOptions:
+                    - CreateNamespace=false
+                    - ServerSideApply=true
+                    - RespectIgnoreDifferences=true
+                    - SkipDryRunOnMissingResource=true
+                  retry:
+                    limit: -1
+                    backoff:
+                      duration: 30s
+                      factor: 2
+                      maxDuration: 5m
+                ignoreDifferences:
+                  - group: self-node-remediation.medik8s.io
+                    kind: SelfNodeRemediationTemplate
+                    jqPathExpressions:
+                      - .status
+                  - group: remediation.medik8s.io
+                    kind: NodeHealthCheck
+                    jqPathExpressions:
+                      - .status
+          - name: descheduler-config
+            path: modules/ocpvirt-workloads-ha/overlays/config-descheduler
+            wave: "3"
+            namespace: ""
+            templatePatch: |
+              spec:
+                dependsOn:
+                  - name: ocpvirt-workloads-ha-rbac
+                  - name: ocpvirt-workloads-ha-install
+                syncPolicy:
+                  syncOptions:
+                    - CreateNamespace=false
+                    - ServerSideApply=true
+                    - RespectIgnoreDifferences=true
+                    - SkipDryRunOnMissingResource=true
+                  retry:
+                    limit: -1
+                    backoff:
+                      duration: 30s
+                      factor: 2
+                      maxDuration: 5m
+                ignoreDifferences:
+                  - group: operator.openshift.io
+                    kind: KubeDescheduler
+                    jqPathExpressions:
+                      - .status
+  template:
+    metadata:
+      name: ocpvirt-workloads-ha-{{.name}}
+      namespace: openshift-gitops
+      labels:
+        app.kubernetes.io/part-of: ocpvirt-workloads-ha
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{.wave}}"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        repoURL: git@github.com:ravishar-rh/operator-config-files.git
+        targetRevision: main
+        path: "{{.path}}"
+      destination:
+        server: https://kubernetes.default.svc
+        {{- if ne .namespace "" }}
+        namespace: {{.namespace}}
+        {{- end }}
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+  templatePatch: |
+    {{.templatePatch}}

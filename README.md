@@ -27,7 +27,7 @@ Repository: https://github.com/ravishar-rh/operator-config-files
 ├── modules/ocpvirt-workloads-ha/     # Kustomize module (install + config)
 │   ├── components/                   # Per-operator install/config bases
 │   ├── overlays/                     # install, config, config-descheduler, all
-│   └── argocd/                       # Argo CD Applications + RBAC
+│   └── argocd/                       # ApplicationSet + RBAC
 └── scripts/                          # oc-only sync and InstallPlan helpers
 ```
 
@@ -61,17 +61,29 @@ The workload OperatorGroup uses `spec: {}` (AllNamespaces mode) — do not set
 | `NodeHealthCheck/nhc-all-linux-nodes` | 7 | Node-health-check operator CRD + SNR template |
 | `KubeDescheduler/cluster` | 8 | Kube descheduler operator CRD |
 
-### Argo CD Applications
+### Argo CD ApplicationSet
 
-| Application | Path | Purpose |
-|-------------|------|---------|
-| `ocpvirt-workloads-ha-root` | `argocd/applications` | App-of-Apps parent |
+A single **ApplicationSet** generates four child Applications. This replaces the
+app-of-apps (`root`) pattern with one bootstrap resource.
+
+| Generated Application | Path | Purpose |
+|----------------------|------|---------|
 | `ocpvirt-workloads-ha-rbac` | `argocd/rbac` | Argo CD controller RBAC |
 | `ocpvirt-workloads-ha-install` | `overlays/install` | OLM subscriptions (Manual InstallPlan) |
 | `ocpvirt-workloads-ha-config` | `overlays/config` | Namespaced config CRs |
 | `ocpvirt-workloads-ha-descheduler-config` | `overlays/config-descheduler` | Cluster-scoped KubeDescheduler (no `destination.namespace`) |
 
+All generated apps carry `app.kubernetes.io/part-of: ocpvirt-workloads-ha` for
+filtering in the Argo CD UI.
+
 Paths are relative to `modules/ocpvirt-workloads-ha/`.
+
+**UI note:** ApplicationSet still creates Application resources — they appear in
+the Applications list. You get one fewer tile (no app-of-apps parent). Filter by
+label `app.kubernetes.io/part-of=ocpvirt-workloads-ha` or use the
+**ApplicationSets** view to manage them as a group. A single Application tile is
+not possible without merging overlays (which breaks install/config/descheduler
+split).
 
 ### Why multiple Argo CD Applications?
 
@@ -152,7 +164,7 @@ After one-time bootstrap, commit and push to apply:
 | Config CRs (NHC, SNR template, KubeDescheduler) | `ocpvirt-workloads-ha-config`, `ocpvirt-workloads-ha-descheduler-config` |
 | Subscriptions, namespaces, OperatorGroups | `ocpvirt-workloads-ha-install` |
 | Argo CD RBAC | `ocpvirt-workloads-ha-rbac` |
-| Application CR fixes (paths, sync policy) | `ocpvirt-workloads-ha-root` → child apps |
+| Application CR / ApplicationSet fixes | `modules/ocpvirt-workloads-ha/argocd/applicationset.yaml` |
 
 All child apps use automated sync and selfHeal. Fix YAML, `git push`, Argo converges.
 
@@ -196,12 +208,15 @@ git push
 
 ```sh
 # 1. Register git repo in Argo CD (see Deployment guide)
-# 2. Bootstrap the app-of-apps
-oc apply -f modules/ocpvirt-workloads-ha/argocd/applications/root.yaml
+# 2. Bootstrap the ApplicationSet (creates all child Applications)
+oc apply -f modules/ocpvirt-workloads-ha/argocd/applicationset.yaml
 ```
 
-After bootstrap, manifest and config changes are **git push only**. RBAC is
-synced by the `ocpvirt-workloads-ha-rbac` Application — no separate `oc apply`.
+If upgrading from the old app-of-apps layout, delete `ocpvirt-workloads-ha-root`
+first (see [Step 2](#step-2--remove-legacy-applications-if-upgrading)).
+
+After bootstrap, manifest and config changes are **git push only**. Edit
+`applicationset.yaml` to change Application paths, sync policy, or waves.
 
 ## Deployment guide
 
@@ -270,22 +285,23 @@ oc label secret repo-operator-config-files \
 ### Step 2 — Remove legacy Applications (if upgrading)
 
 ```sh
-for app in openshift-workload-operators openshift-workload-operators-install \
+# Old app-of-apps and pre-ApplicationSet layout
+for app in ocpvirt-workloads-ha-root openshift-workload-operators openshift-workload-operators-install \
            openshift-workload-operators-config openshift-workload-operators-descheduler-config \
            operator-config-files-root; do
   oc delete application "${app}" -n openshift-gitops --ignore-not-found
 done
+oc delete applicationset ocpvirt-workloads-ha -n openshift-gitops --ignore-not-found
 ```
 
 ### Step 3 — Bootstrap (one time)
 
 ```sh
-oc apply -f modules/ocpvirt-workloads-ha/argocd/applications/root.yaml
-oc get applications -n openshift-gitops
+oc apply -f modules/ocpvirt-workloads-ha/argocd/applicationset.yaml
+oc get applicationset,application -n openshift-gitops | grep ocpvirt
 ```
 
-This creates five child Applications: `rbac`, `install`, `config`,
-`descheduler-config`, all with automated sync.
+This creates one ApplicationSet and four child Applications with automated sync.
 
 ### Step 4 — Push and let Argo CD sync manifests
 
@@ -375,7 +391,7 @@ Use when Argo CD itself is stuck or Level 1 did not clear the failure.
 
 **Why simple `oc delete application` often fails:**
 
-1. **App-of-apps recreates child apps** — `ocpvirt-workloads-ha-root` has automated sync.
+1. **ApplicationSet recreates child apps** — delete the ApplicationSet before child apps.
 2. **Finalizers block deletion** — apps use `resources-finalizer.argocd.argoproj.io`.
 3. **Apps stuck in Terminating** — remove finalizers manually (step D below).
 
@@ -389,9 +405,8 @@ oc delete operatorgroup --all -n openshift-workload-availability --ignore-not-fo
 oc delete subscription,csv,installplan --all -n openshift-kube-descheduler-operator --ignore-not-found
 oc delete operatorgroup --all -n openshift-kube-descheduler-operator --ignore-not-found
 
-# B — Stop root app from recreating children
-oc patch application ocpvirt-workloads-ha-root -n openshift-gitops --type=json \
-  -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]' 2>/dev/null || true
+# B — Delete ApplicationSet (stops recreation of child apps)
+oc delete applicationset ocpvirt-workloads-ha -n openshift-gitops --ignore-not-found
 
 # C & D — Delete apps and clear finalizers
 for app in ocpvirt-workloads-ha-config ocpvirt-workloads-ha-descheduler-config \
@@ -489,7 +504,7 @@ oc get route openshift-gitops-server -n openshift-gitops \
 | KubeDescheduler namespace missing | Wrong Application syncing cluster-scoped CR | Ensure only `ocpvirt-workloads-ha-descheduler-config` deploys KubeDescheduler (no `destination.namespace`) |
 | KubeDescheduler validation error | `devLowNodeUtilizationThresholds` must be a string | Set to `Low`, `Medium`, or `High` in kube-descheduler-cluster.yaml |
 | Argo CD forbidden on config CRs | RBAC app not synced | Confirm `ocpvirt-workloads-ha-rbac` is Synced |
-| Application will not delete | Root app recreates children / finalizers | [Level 2 reset](#level-2-full-reset-including-argocd-apps) |
+| Application will not delete | ApplicationSet recreates children / finalizers | Delete ApplicationSet first; see [Level 2](#level-2-full-reset-including-argocd-apps) |
 | Argo CD cannot reach GitHub | Missing or wrong repo secret | Re-create secret per [Step 1](#step-1--push-repo-and-register-in-argocd) |
 
 ### OwnNamespace error (detail)

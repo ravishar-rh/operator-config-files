@@ -11,8 +11,8 @@ modules/ocpvirt-workloads-ha/
 ├── components/                     # per-operator install/config bases
 ├── overlays/                       # install, config, config-descheduler, all
 └── argocd/
-    ├── applications/               # Argo CD Application CRs (app-of-apps)
-    └── rbac/                       # Argo CD controller RBAC (synced via git)
+    ├── applicationset.yaml         # generates all Argo CD Applications
+    └── rbac/                       # Argo CD controller RBAC
 ```
 
 ## Kustomize builds
@@ -28,7 +28,7 @@ kubectl kustomize modules/ocpvirt-workloads-ha/overlays/config-descheduler
 ## Bootstrap (one time per cluster)
 
 ```sh
-oc apply -f modules/ocpvirt-workloads-ha/argocd/applications/root.yaml
+oc apply -f modules/ocpvirt-workloads-ha/argocd/applicationset.yaml
 ```
 
 After bootstrap, manifest and config changes are delivered via `git push`.
